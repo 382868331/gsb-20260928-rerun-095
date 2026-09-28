@@ -1,0 +1,34 @@
+{
+  "listen_addr": ":18080",
+  "admin_path": "/__gateway__",
+  "routes": [
+    {
+      "id": "demo-v1",
+      "version": "v1",
+      "prefix": "/v1/demo",
+      "upstream_ids": ["demo-v1"],
+      "retry_enabled": true,
+      "retry_methods": ["GET"],
+      "max_attempts": 2
+    },
+    {
+      "id": "demo-v2",
+      "version": "v2",
+      "prefix": "/v2/demo",
+      "upstream_ids": ["demo-v2"],
+      "retry_enabled": false,
+      "max_attempts": 1
+    }
+  ],
+  "upstreams": [
+    {
+      "id": "demo-v1",
+      "url": "http://127.0.0.1:18081"
+    },
+    {
+      "id": "demo-v2",
+      "url": "http://127.0.0.1:18082"
+    }
+  ]
+}
+
