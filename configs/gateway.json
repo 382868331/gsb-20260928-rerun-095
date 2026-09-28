@@ -1,0 +1,45 @@
+{
+  "listen": "127.0.0.1:8080",
+  "admin_path": "/__gateway",
+  "drain_timeout": "30s",
+  "upstreams": [
+    {
+      "id": "local-v1",
+      "base_url": "http://127.0.0.1:18081",
+      "timeout": "10s"
+    },
+    {
+      "id": "local-v2",
+      "base_url": "http://127.0.0.1:18082",
+      "timeout": "10s"
+    }
+  ],
+  "routes": [
+    {
+      "id": "api-v2",
+      "version": "v2",
+      "prefix": "/v2/",
+      "upstream_id": "local-v2",
+      "strip_prefix": true,
+      "retry": {
+        "methods": ["GET", "HEAD"],
+        "max_attempts": 2,
+        "retry_on_status": [502, 503, 504],
+        "retry_on_connect": true
+      }
+    },
+    {
+      "id": "api-v1",
+      "version": "v1",
+      "prefix": "/v1/",
+      "upstream_id": "local-v1",
+      "strip_prefix": true,
+      "retry": {
+        "methods": ["GET", "HEAD"],
+        "max_attempts": 2,
+        "retry_on_status": [502, 503, 504],
+        "retry_on_connect": true
+      }
+    }
+  ]
+}
