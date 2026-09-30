@@ -9,6 +9,9 @@ type Record struct {
 	ID            string        `json:"id"`
 	StartedAt     time.Time     `json:"started_at"`
 	Duration      time.Duration `json:"duration"`
+	ReleaseID     string        `json:"release_id"`
+	Revision      string        `json:"revision"`
+	Canary        bool          `json:"canary"`
 	RouteID       string        `json:"route_id"`
 	Version       string        `json:"version"`
 	UpstreamID    string        `json:"upstream_id"`

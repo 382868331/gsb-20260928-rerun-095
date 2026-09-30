@@ -12,12 +12,18 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"gateway/internal/config"
 	"gateway/internal/record"
+	"gateway/internal/release"
 	"gateway/internal/state"
 )
+
+const CanaryRevisionHeader = "X-Gateway-Canary-Revision"
+
+var errDrainTimeout = errors.New("gateway drain timeout exceeded")
 
 var hopHeaders = []string{
 	"Connection",
@@ -35,10 +41,21 @@ type Proxy struct {
 	configs   *config.Store
 	upstreams *state.Store
 	records   *record.Store
+	releases  *release.Manager
 	client    *http.Client
+	activeMu  sync.Mutex
+	active    map[*inFlight]struct{}
+	stopping  bool
 }
 
-func New(configs *config.Store, upstreams *state.Store, records *record.Store) *Proxy {
+type inFlight struct {
+	releaseID string
+	revision  string
+	canary    bool
+	cancel    context.CancelCauseFunc
+}
+
+func New(configs *config.Store, upstreams *state.Store, records *record.Store, releases *release.Manager) *Proxy {
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		MaxIdleConns:          100,
@@ -50,26 +67,43 @@ func New(configs *config.Store, upstreams *state.Store, records *record.Store) *
 		configs:   configs,
 		upstreams: upstreams,
 		records:   records,
+		releases:  releases,
 		client:    &http.Client{Transport: transport},
+		active:    make(map[*inFlight]struct{}),
 	}
 }
 
-func NewWithTransport(configs *config.Store, upstreams *state.Store, records *record.Store, transport http.RoundTripper) *Proxy {
+func NewWithTransport(configs *config.Store, upstreams *state.Store, records *record.Store, releases *release.Manager, transport http.RoundTripper) *Proxy {
+	proxy := &Proxy{
+		configs:   configs,
+		upstreams: upstreams,
+		records:   records,
+		releases:  releases,
+		client:    &http.Client{Transport: transport},
+		active:    make(map[*inFlight]struct{}),
+	}
+	return proxy
+}
+
+// NewWithHTTPClient injects a client, used to route upstream traffic over
+// in-memory connections in tests while preserving the full proxy path.
+func NewWithHTTPClient(configs *config.Store, upstreams *state.Store, records *record.Store, releases *release.Manager, client *http.Client) *Proxy {
 	return &Proxy{
 		configs:   configs,
 		upstreams: upstreams,
 		records:   records,
-		client:    &http.Client{Transport: transport},
+		releases:  releases,
+		client:    client,
+		active:    make(map[*inFlight]struct{}),
 	}
 }
 
-func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
-	snapshot := p.configs.Current()
-	if strings.HasPrefix(request.URL.Path, snapshot.AdminPath) {
-		http.NotFound(writer, request)
-		return
-	}
+// SetClient replaces the upstream HTTP client used by subsequent requests.
+func (p *Proxy) SetClient(client *http.Client) {
+	p.client = client
+}
 
+func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	started := time.Now()
 	entry := record.Record{
 		ID:            newID(),
@@ -78,6 +112,48 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		Path:          request.URL.Path,
 		Query:         request.URL.RawQuery,
 		ClientAddress: request.RemoteAddr,
+	}
+
+	current := p.releases.Current()
+	snapshot := current.Snapshot
+	flight := &inFlight{releaseID: current.ID, revision: current.Revision}
+	if canaryRevision := request.Header.Get(CanaryRevisionHeader); canaryRevision != "" {
+		if canary, ok := p.releases.CanaryAllow(canaryRevision); ok {
+			snapshot = canary.Snapshot
+			flight.releaseID = canary.ID
+			flight.revision = canary.Revision
+			flight.canary = true
+		} else {
+			entry.Duration = time.Since(started)
+			entry.Error = "canary revision not found or rehearsal budget exhausted"
+			p.records.Add(entry)
+			http.Error(writer, entry.Error, http.StatusConflict)
+			return
+		}
+	}
+
+	if strings.HasPrefix(request.URL.Path, snapshot.AdminPath) {
+		http.NotFound(writer, request)
+		return
+	}
+
+	requestCtx, cancel := context.WithCancelCause(request.Context())
+	flight.cancel = cancel
+	request = request.WithContext(requestCtx)
+	if !p.begin(flight) {
+		cancel(nil)
+		http.Error(writer, "gateway is shutting down", http.StatusServiceUnavailable)
+		return
+	}
+	defer p.end(flight)
+
+	entry.ReleaseID = flight.releaseID
+	entry.Revision = flight.revision
+	entry.Canary = flight.canary
+	writer.Header().Set("X-Gateway-Release", flight.releaseID)
+	writer.Header().Set("X-Gateway-Revision", flight.revision)
+	if flight.canary {
+		writer.Header().Set("X-Gateway-Canary", "true")
 	}
 
 	matched, ok := snapshot.Match(request)
@@ -105,6 +181,90 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	entry.Duration = time.Since(started)
 	p.records.Add(entry)
 	finish(status < 500 && errText == "", errText)
+	if flight.canary {
+		p.releases.CanaryRecord(flight.releaseID, status, status >= 500 || errText != "")
+	}
+}
+
+func (p *Proxy) begin(flight *inFlight) bool {
+	p.activeMu.Lock()
+	defer p.activeMu.Unlock()
+	if p.stopping {
+		return false
+	}
+	p.active[flight] = struct{}{}
+	return true
+}
+
+func (p *Proxy) end(flight *inFlight) {
+	p.activeMu.Lock()
+	delete(p.active, flight)
+	p.activeMu.Unlock()
+}
+
+// ActiveRequests reports which release revision every in-flight request is
+// pinned to. The snapshot is taken at entry and never changes mid-request.
+func (p *Proxy) ActiveRequests() []map[string]string {
+	p.activeMu.Lock()
+	defer p.activeMu.Unlock()
+	result := make([]map[string]string, 0, len(p.active))
+	for flight := range p.active {
+		result = append(result, map[string]string{
+			"release_id": flight.releaseID,
+			"revision":   flight.revision,
+			"canary":     strconv.FormatBool(flight.canary),
+		})
+	}
+	return result
+}
+
+// BeginDrain stops accepting new requests. Requests that do not finish within
+// the timeout receive an explicit terminal cause rather than hanging forever.
+func (p *Proxy) BeginDrain(timeout time.Duration) (int, int) {
+	p.activeMu.Lock()
+	p.stopping = true
+	flights := make([]*inFlight, 0, len(p.active))
+	for flight := range p.active {
+		flights = append(flights, flight)
+	}
+	p.activeMu.Unlock()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	aborted := 0
+	for {
+		if p.activeCount() == 0 {
+			return len(flights), 0
+		}
+		select {
+		case <-timer.C:
+			p.activeMu.Lock()
+			for flight := range p.active {
+				flight.cancel(errDrainTimeout)
+				aborted++
+			}
+			p.activeMu.Unlock()
+			drainWait := time.NewTimer(2 * time.Second)
+			for p.activeCount() > 0 {
+				select {
+				case <-drainWait.C:
+					return len(flights), aborted
+				case <-ticker.C:
+				}
+			}
+			drainWait.Stop()
+			return len(flights), aborted
+		case <-ticker.C:
+		}
+	}
+}
+
+func (p *Proxy) activeCount() int {
+	p.activeMu.Lock()
+	defer p.activeMu.Unlock()
+	return len(p.active)
 }
 
 func (p *Proxy) forward(writer http.ResponseWriter, request *http.Request, snapshot *config.Snapshot, matched *config.Match) (int, int, int64, string, bool) {
@@ -135,6 +295,10 @@ func (p *Proxy) forward(writer http.ResponseWriter, request *http.Request, snaps
 		response, err := p.client.Do(upstreamRequest)
 		if err != nil {
 			cancel()
+			if errors.Is(context.Cause(request.Context()), errDrainTimeout) {
+				writeClientError(writer, http.StatusServiceUnavailable, "gateway shutdown: drain timeout exceeded")
+				return http.StatusServiceUnavailable, attempt, bytesOut, errDrainTimeout.Error(), false
+			}
 			if attempt < maxAttempts && matched.Route.Retry.RetryOnConnect && isRetryableRequestError(request.Context(), err) {
 				lastStatus = http.StatusBadGateway
 				continue
@@ -162,6 +326,9 @@ func (p *Proxy) forward(writer http.ResponseWriter, request *http.Request, snaps
 		response.Body.Close()
 		cancel()
 		if err != nil {
+			if errors.Is(context.Cause(request.Context()), errDrainTimeout) {
+				return http.StatusServiceUnavailable, attempt, bytesOut, "gateway shutdown: drain timeout exceeded", false
+			}
 			if errors.Is(request.Context().Err(), context.Canceled) {
 				return 499, attempt, bytesOut, "client canceled during response", true
 			}

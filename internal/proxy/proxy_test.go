@@ -11,6 +11,7 @@ import (
 
 	"gateway/internal/config"
 	"gateway/internal/record"
+	"gateway/internal/release"
 	"gateway/internal/state"
 )
 
@@ -112,10 +113,19 @@ func TestInFlightRequestKeepsOldSnapshot(t *testing.T) {
 	newTransport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		return textResponse(http.StatusOK, "new-upstream"), nil
 	})
-	configs := config.NewStore(mustSnapshot(t))
+	oldConfig := fullConfig("http://old.example")
+	oldSnapshot, err := oldConfig.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	configs := config.NewStore(oldSnapshot)
 	upstreams := state.NewStore()
 	records := record.NewStore(100)
-	handler := NewWithTransport(configs, upstreams, records, oldTransport)
+	releases, err := release.NewManager(oldConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewWithTransport(configs, upstreams, records, releases, oldTransport)
 
 	firstDone := make(chan httptest.ResponseRecorder)
 	go func() {
@@ -124,7 +134,26 @@ func TestInFlightRequestKeepsOldSnapshot(t *testing.T) {
 		firstDone <- *destination
 	}()
 	<-reachedOld
-	configs.Replace(mustSnapshot(t))
+	newConfig := fullConfig("http://new.example")
+	candidate, err := releases.Propose(newConfig, "test cutover")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Unit-level snapshot swap: mark canary concluded before promotion.
+	if _, err := releases.BeginCanary(candidate.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	allowed, ok := releases.CanaryAllow(candidate.Revision)
+	if !ok {
+		t.Fatal("canary slot unavailable")
+	}
+	releases.CanaryRecord(allowed.ID, http.StatusOK, false)
+	if _, err := releases.EndCanary(candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := releases.Promote(candidate.ID, ""); err != nil {
+		t.Fatal(err)
+	}
 	handler.client = &http.Client{Transport: newTransport}
 	close(releaseOld)
 	oldResult := <-firstDone
@@ -160,10 +189,37 @@ func textResponse(status int, body string) *http.Response {
 }
 
 func newTestProxy(transport http.RoundTripper) (http.Handler, *record.Store) {
-	configs := config.NewStore(mustSnapshot(nil))
+	cfg := fullConfig("http://local.example")
+	snapshot, _ := cfg.Snapshot()
+	configs := config.NewStore(snapshot)
 	upstreams := state.NewStore()
 	records := record.NewStore(100)
-	return NewWithTransport(configs, upstreams, records, transport), records
+	releases, err := release.NewManager(cfg)
+	if err != nil {
+		panic(err)
+	}
+	return NewWithTransport(configs, upstreams, records, releases, transport), records
+}
+
+func fullConfig(baseURL string) *config.Config {
+	return &config.Config{
+		Listen:    "127.0.0.1:0",
+		AdminPath: "/__gateway",
+		Upstreams: []config.Upstream{{ID: "local", BaseURL: baseURL, Timeout: config.Duration(5 * time.Second)}},
+		Routes: []config.Route{{
+			ID:          "v1",
+			Version:     "v1",
+			Prefix:      "/v1/",
+			UpstreamID:  "local",
+			StripPrefix: true,
+			Retry: config.RetryPolicy{
+				Methods:        []string{http.MethodGet, http.MethodHead},
+				MaxAttempts:    2,
+				RetryOnStatus:  []int{http.StatusServiceUnavailable, http.StatusBadGateway, http.StatusGatewayTimeout},
+				RetryOnConnect: true,
+			},
+		}},
+	}
 }
 
 func mustSnapshot(t testing.TB) *config.Snapshot {

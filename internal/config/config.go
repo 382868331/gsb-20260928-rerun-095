@@ -36,6 +36,10 @@ func (d *Duration) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+func (d Duration) MarshalJSON() ([]byte, error) {
+	return json.Marshal(time.Duration(d).String())
+}
+
 type Upstream struct {
 	ID      string   `json:"id"`
 	BaseURL string   `json:"base_url"`
