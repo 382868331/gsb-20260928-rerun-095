@@ -76,6 +76,15 @@ type Match struct {
 	Upstream *Upstream
 }
 
+// DescribeRoutes returns stable route summaries used in release audit records.
+func (s *Snapshot) DescribeRoutes() []string {
+	result := make([]string, 0, len(s.routes))
+	for _, candidate := range s.routes {
+		result = append(result, candidate.route.ID+"@"+candidate.route.Version)
+	}
+	return result
+}
+
 func (s *Snapshot) Match(request *http.Request) (*Match, bool) {
 	for _, candidate := range s.routes {
 		if hasPrefix(request.URL.Path, candidate.route.Prefix) {

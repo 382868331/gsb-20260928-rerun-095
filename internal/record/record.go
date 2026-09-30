@@ -10,6 +10,7 @@ type Record struct {
 	StartedAt     time.Time     `json:"started_at"`
 	Duration      time.Duration `json:"duration"`
 	RouteID       string        `json:"route_id"`
+	ReleaseID     string        `json:"release_id"`
 	Version       string        `json:"version"`
 	UpstreamID    string        `json:"upstream_id"`
 	Method        string        `json:"method"`
@@ -22,6 +23,7 @@ type Record struct {
 	ClientAddress string        `json:"client_address"`
 	Error         string        `json:"error,omitempty"`
 	Canceled      bool          `json:"canceled"`
+	Aborted       bool          `json:"aborted"`
 }
 
 type Store struct {

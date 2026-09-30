@@ -12,12 +12,19 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"gateway/internal/config"
 	"gateway/internal/record"
+	"gateway/internal/release"
 	"gateway/internal/state"
 )
+
+// ErrShutdownDeadline cancels in-flight requests that outlast the drain
+// window so they reach a clear terminal state instead of being cut silently.
+var ErrShutdownDeadline = errors.New("shutdown deadline exceeded")
 
 var hopHeaders = []string{
 	"Connection",
@@ -32,13 +39,18 @@ var hopHeaders = []string{
 }
 
 type Proxy struct {
-	configs   *config.Store
+	releases  *release.Store
 	upstreams *state.Store
 	records   *record.Store
 	client    *http.Client
+
+	draining atomic.Bool
+	inflight sync.WaitGroup
+	abortMu  sync.Mutex
+	aborts   map[string]context.CancelCauseFunc
 }
 
-func New(configs *config.Store, upstreams *state.Store, records *record.Store) *Proxy {
+func New(releases *release.Store, upstreams *state.Store, records *record.Store) *Proxy {
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		MaxIdleConns:          100,
@@ -46,30 +58,51 @@ func New(configs *config.Store, upstreams *state.Store, records *record.Store) *
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
+	return NewWithTransport(releases, upstreams, records, transport)
+}
+
+func NewWithTransport(releases *release.Store, upstreams *state.Store, records *record.Store, transport http.RoundTripper) *Proxy {
 	return &Proxy{
-		configs:   configs,
+		releases:  releases,
 		upstreams: upstreams,
 		records:   records,
 		client:    &http.Client{Transport: transport},
+		aborts:    make(map[string]context.CancelCauseFunc),
 	}
 }
 
-func NewWithTransport(configs *config.Store, upstreams *state.Store, records *record.Store, transport http.RoundTripper) *Proxy {
-	return &Proxy{
-		configs:   configs,
-		upstreams: upstreams,
-		records:   records,
-		client:    &http.Client{Transport: transport},
+// BeginDrain stops new requests from being accepted; in-flight requests keep
+// their snapshots and finish normally within the drain window.
+func (p *Proxy) BeginDrain() {
+	p.draining.Store(true)
+}
+
+// WaitInflight reports whether all in-flight requests finished within timeout.
+func (p *Proxy) WaitInflight(timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		p.inflight.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
+// AbortInflight cancels every remaining in-flight request with
+// ErrShutdownDeadline so each one is recorded with a clear terminal state.
+func (p *Proxy) AbortInflight() {
+	p.abortMu.Lock()
+	defer p.abortMu.Unlock()
+	for _, cancel := range p.aborts {
+		cancel(ErrShutdownDeadline)
 	}
 }
 
 func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
-	snapshot := p.configs.Current()
-	if strings.HasPrefix(request.URL.Path, snapshot.AdminPath) {
-		http.NotFound(writer, request)
-		return
-	}
-
 	started := time.Now()
 	entry := record.Record{
 		ID:            newID(),
@@ -79,6 +112,39 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		Query:         request.URL.RawQuery,
 		ClientAddress: request.RemoteAddr,
 	}
+
+	p.inflight.Add(1)
+	defer p.inflight.Done()
+	if p.draining.Load() {
+		entry.Status = http.StatusServiceUnavailable
+		entry.Duration = time.Since(started)
+		entry.Error = "gateway draining"
+		p.records.Add(entry)
+		http.Error(writer, "gateway draining", http.StatusServiceUnavailable)
+		return
+	}
+
+	snapshot := p.releases.Current()
+	if strings.HasPrefix(request.URL.Path, snapshot.AdminPath) {
+		http.NotFound(writer, request)
+		return
+	}
+
+	ctx, cancel := context.WithCancelCause(request.Context())
+	defer cancel(nil)
+	p.abortMu.Lock()
+	p.aborts[entry.ID] = cancel
+	p.abortMu.Unlock()
+	defer func() {
+		p.abortMu.Lock()
+		delete(p.aborts, entry.ID)
+		p.abortMu.Unlock()
+	}()
+	request = request.WithContext(ctx)
+
+	snapshot, releaseID := p.releases.Select(request)
+	entry.ReleaseID = releaseID
+	request.Header.Set(release.RehearsalHeader, releaseID)
 
 	matched, ok := snapshot.Match(request)
 	if !ok {
@@ -95,19 +161,20 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	entry.UpstreamID = matched.Upstream.ID
 	finish := p.upstreams.Begin(matched.Upstream.ID)
 
-	status, attempts, bytesOut, errText, canceled := p.forward(writer, request, snapshot, matched)
+	status, attempts, bytesOut, errText, canceled, aborted := p.forward(writer, request, matched)
 	entry.Status = status
 	entry.Attempts = attempts
 	entry.BytesIn = request.ContentLength
 	entry.BytesOut = bytesOut
 	entry.Error = errText
 	entry.Canceled = canceled
+	entry.Aborted = aborted
 	entry.Duration = time.Since(started)
 	p.records.Add(entry)
 	finish(status < 500 && errText == "", errText)
 }
 
-func (p *Proxy) forward(writer http.ResponseWriter, request *http.Request, snapshot *config.Snapshot, matched *config.Match) (int, int, int64, string, bool) {
+func (p *Proxy) forward(writer http.ResponseWriter, request *http.Request, matched *config.Match) (int, int, int64, string, bool, bool) {
 	requestBody, buffered := p.requestBody(request, matched.Route.Retry)
 	maxAttempts := 1
 	if canRetry(request.Method, matched.Route.Retry.Methods) {
@@ -130,21 +197,24 @@ func (p *Proxy) forward(writer http.ResponseWriter, request *http.Request, snaps
 		upstreamRequest, cancel, err := p.buildRequest(request, matched, attemptBody, attempt)
 		if err != nil {
 			writeClientError(writer, http.StatusBadGateway, "bad gateway")
-			return http.StatusBadGateway, attempt, bytesOut, err.Error(), false
+			return http.StatusBadGateway, attempt, bytesOut, err.Error(), false, false
 		}
 		response, err := p.client.Do(upstreamRequest)
 		if err != nil {
 			cancel()
+			if errors.Is(context.Cause(request.Context()), ErrShutdownDeadline) {
+				return http.StatusServiceUnavailable, attempt, bytesOut, ErrShutdownDeadline.Error(), false, true
+			}
 			if attempt < maxAttempts && matched.Route.Retry.RetryOnConnect && isRetryableRequestError(request.Context(), err) {
 				lastStatus = http.StatusBadGateway
 				continue
 			}
 			if errors.Is(request.Context().Err(), context.Canceled) {
 				writeClientError(writer, 499, "client canceled")
-				return 499, attempt, bytesOut, "client canceled", true
+				return 499, attempt, bytesOut, "client canceled", true, false
 			}
 			writeClientError(writer, http.StatusBadGateway, "bad gateway")
-			return http.StatusBadGateway, attempt, bytesOut, err.Error(), false
+			return http.StatusBadGateway, attempt, bytesOut, err.Error(), false, false
 		}
 
 		if attempt < maxAttempts && containsStatus(matched.Route.Retry.RetryOnStatus, response.StatusCode) {
@@ -162,16 +232,19 @@ func (p *Proxy) forward(writer http.ResponseWriter, request *http.Request, snaps
 		response.Body.Close()
 		cancel()
 		if err != nil {
-			if errors.Is(request.Context().Err(), context.Canceled) {
-				return 499, attempt, bytesOut, "client canceled during response", true
+			if errors.Is(context.Cause(request.Context()), ErrShutdownDeadline) {
+				return response.StatusCode, attempt, bytesOut, ErrShutdownDeadline.Error(), false, true
 			}
-			return response.StatusCode, attempt, bytesOut, err.Error(), false
+			if errors.Is(request.Context().Err(), context.Canceled) {
+				return 499, attempt, bytesOut, "client canceled during response", true, false
+			}
+			return response.StatusCode, attempt, bytesOut, err.Error(), false, false
 		}
-		return response.StatusCode, attempt, bytesOut, "", false
+		return response.StatusCode, attempt, bytesOut, "", false, false
 	}
 
 	writeClientError(writer, lastStatus, "bad gateway")
-	return lastStatus, maxAttempts, bytesOut, "retry attempts exhausted", false
+	return lastStatus, maxAttempts, bytesOut, "retry attempts exhausted", false, false
 }
 
 func writeClientError(writer http.ResponseWriter, status int, message string) {

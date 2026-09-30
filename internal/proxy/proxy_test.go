@@ -11,6 +11,7 @@ import (
 
 	"gateway/internal/config"
 	"gateway/internal/record"
+	"gateway/internal/release"
 	"gateway/internal/state"
 )
 
@@ -112,10 +113,10 @@ func TestInFlightRequestKeepsOldSnapshot(t *testing.T) {
 	newTransport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		return textResponse(http.StatusOK, "new-upstream"), nil
 	})
-	configs := config.NewStore(mustSnapshot(t))
+	releases := release.NewStore(mustSnapshot(t))
 	upstreams := state.NewStore()
 	records := record.NewStore(100)
-	handler := NewWithTransport(configs, upstreams, records, oldTransport)
+	handler := NewWithTransport(releases, upstreams, records, oldTransport)
 
 	firstDone := make(chan httptest.ResponseRecorder)
 	go func() {
@@ -124,7 +125,10 @@ func TestInFlightRequestKeepsOldSnapshot(t *testing.T) {
 		firstDone <- *destination
 	}()
 	<-reachedOld
-	configs.Replace(mustSnapshot(t))
+	candidate := releases.Stage(mustSnapshot(t))
+	if _, err := releases.Confirm(candidate.ID); err != nil {
+		t.Fatal(err)
+	}
 	handler.client = &http.Client{Transport: newTransport}
 	close(releaseOld)
 	oldResult := <-firstDone
@@ -160,10 +164,10 @@ func textResponse(status int, body string) *http.Response {
 }
 
 func newTestProxy(transport http.RoundTripper) (http.Handler, *record.Store) {
-	configs := config.NewStore(mustSnapshot(nil))
+	releases := release.NewStore(mustSnapshot(nil))
 	upstreams := state.NewStore()
 	records := record.NewStore(100)
-	return NewWithTransport(configs, upstreams, records, transport), records
+	return NewWithTransport(releases, upstreams, records, transport), records
 }
 
 func mustSnapshot(t testing.TB) *config.Snapshot {

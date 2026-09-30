@@ -3,66 +3,118 @@ package admin
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 
-	"gateway/internal/config"
 	"gateway/internal/record"
+	"gateway/internal/release"
 	"gateway/internal/state"
 )
 
 type Admin struct {
-	configs    *config.Store
-	upstreams  *state.Store
-	records    *record.Store
-	configPath string
-	reload     func() error
+	releases  *release.Store
+	upstreams *state.Store
+	records   *record.Store
+	stage     func() (release.Candidate, error)
+	confirm   func(string) (release.Release, error)
+	rollback  func(string) (release.Release, error)
 }
 
-func New(configs *config.Store, upstreams *state.Store, records *record.Store, configPath string, reload func() error) *Admin {
+func New(
+	releases *release.Store,
+	upstreams *state.Store,
+	records *record.Store,
+	stage func() (release.Candidate, error),
+	confirm func(string) (release.Release, error),
+	rollback func(string) (release.Release, error),
+) *Admin {
 	return &Admin{
-		configs:    configs,
-		upstreams:  upstreams,
-		records:    records,
-		configPath: configPath,
-		reload:     reload,
+		releases:  releases,
+		upstreams: upstreams,
+		records:   records,
+		stage:     stage,
+		confirm:   confirm,
+		rollback:  rollback,
 	}
 }
 
 func (a *Admin) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
-	if request.Method != http.MethodGet {
-		http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
-		return
+	relative := strings.TrimPrefix(request.URL.Path, a.releases.Current().AdminPath)
+	if relative == "" {
+		relative = "/"
 	}
-	writer.Header().Set("Content-Type", "application/json")
-	switch request.URL.Path {
-	case a.configs.Current().AdminPath + "/upstreams":
-		json.NewEncoder(writer).Encode(a.upstreams.Snapshot())
-	case a.configs.Current().AdminPath + "/requests":
-		json.NewEncoder(writer).Encode(a.records.Snapshot())
-	case a.configs.Current().AdminPath + "/config":
-		current := a.configs.Current()
-		json.NewEncoder(writer).Encode(map[string]any{
+	switch {
+	case request.Method == http.MethodGet && relative == "/upstreams":
+		a.writeJSON(writer, http.StatusOK, a.upstreams.Snapshot())
+	case request.Method == http.MethodGet && relative == "/requests":
+		a.writeJSON(writer, http.StatusOK, a.records.Snapshot())
+	case request.Method == http.MethodGet && relative == "/config":
+		current := a.releases.Current()
+		a.writeJSON(writer, http.StatusOK, map[string]any{
+			"release_id":    a.releases.CurrentID(),
 			"listen":        current.Listen,
 			"admin_path":    current.AdminPath,
 			"drain_timeout": current.DrainTimeout.String(),
 		})
+	case request.Method == http.MethodGet && relative == "/releases":
+		a.writeJSON(writer, http.StatusOK, map[string]any{
+			"active":   a.releases.CurrentID(),
+			"releases": a.releases.History(),
+		})
+	case request.Method == http.MethodGet && relative == "/candidates":
+		a.writeJSON(writer, http.StatusOK, a.releases.Candidates())
+	case request.Method == http.MethodPost && relative == "/candidates":
+		a.handleStage(writer)
+	case request.Method == http.MethodPost && strings.HasPrefix(relative, "/candidates/") && strings.HasSuffix(relative, "/confirm"):
+		id := strings.TrimSuffix(strings.TrimPrefix(relative, "/candidates/"), "/confirm")
+		a.handleConfirm(writer, id)
+	case request.Method == http.MethodPost && relative == "/rollback":
+		a.handleRollback(writer, request)
 	default:
-		writer.WriteHeader(http.StatusNotFound)
-		json.NewEncoder(writer).Encode(map[string]string{"error": "unknown admin endpoint"})
+		a.writeJSON(writer, http.StatusNotFound, map[string]string{"error": "unknown admin endpoint"})
 	}
 }
 
-func (a *Admin) Reload(writer http.ResponseWriter, request *http.Request) {
-	if request.Method != http.MethodPost {
-		writer.Header().Set("Allow", http.MethodPost)
-		http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
+// handleStage validates the on-disk configuration and registers it as a
+// candidate. Invalid configurations are rejected without touching the active
+// release.
+func (a *Admin) handleStage(writer http.ResponseWriter) {
+	candidate, err := a.stage()
+	if err != nil {
+		a.writeJSON(writer, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	if err := a.reload(); err != nil {
-		writer.Header().Set("Content-Type", "application/json")
-		writer.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(writer).Encode(map[string]string{"error": err.Error()})
+	a.writeJSON(writer, http.StatusCreated, candidate)
+}
+
+func (a *Admin) handleConfirm(writer http.ResponseWriter, candidateID string) {
+	activated, err := a.confirm(candidateID)
+	if err != nil {
+		a.writeJSON(writer, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	a.writeJSON(writer, http.StatusOK, activated)
+}
+
+func (a *Admin) handleRollback(writer http.ResponseWriter, request *http.Request) {
+	target := request.URL.Query().Get("release")
+	if target == "" && request.Body != nil {
+		var body struct {
+			ReleaseID string `json:"release_id"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&body); err == nil {
+			target = body.ReleaseID
+		}
+	}
+	activated, err := a.rollback(target)
+	if err != nil {
+		a.writeJSON(writer, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	a.writeJSON(writer, http.StatusOK, activated)
+}
+
+func (a *Admin) writeJSON(writer http.ResponseWriter, status int, value any) {
 	writer.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(writer).Encode(map[string]string{"status": "reloaded"})
+	writer.WriteHeader(status)
+	_ = json.NewEncoder(writer).Encode(value)
 }
