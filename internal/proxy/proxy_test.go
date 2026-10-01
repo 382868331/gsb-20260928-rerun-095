@@ -126,10 +126,17 @@ func TestInFlightRequestKeepsOldSnapshot(t *testing.T) {
 	}()
 	<-reachedOld
 	candidate := releases.Stage(mustSnapshot(t))
+	handler.client = &http.Client{Transport: newTransport}
+	rehearsal := httptest.NewRequest(http.MethodGet, "/v1/echo/ping", nil)
+	rehearsal.Header.Set(release.RehearsalHeader, candidate.ID)
+	rehearsalRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(rehearsalRecorder, rehearsal)
+	if rehearsalRecorder.Body.String() != "new-upstream" {
+		t.Fatalf("rehearsal body = %q", rehearsalRecorder.Body.String())
+	}
 	if _, err := releases.Confirm(candidate.ID); err != nil {
 		t.Fatal(err)
 	}
-	handler.client = &http.Client{Transport: newTransport}
 	close(releaseOld)
 	oldResult := <-firstDone
 	if oldResult.Body.String() != "old-upstream" {

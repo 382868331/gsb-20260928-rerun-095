@@ -36,7 +36,7 @@ curl -i http://127.0.0.1:8080/v1/flaky
 
 ## 候选发布与回退
 
-配置更新走可审查的候选发布流程，每次激活都留下不可篡改的发布记录：
+配置更新走可审查的候选发布流程，有限演练是发布的强制条件，每次激活都留下不可篡改的发布记录：
 
 ```bash
 # 1. 修改配置文件后，把新配置登记为候选（独立校验，失败不影响现役配置）
@@ -45,19 +45,27 @@ curl -X POST http://127.0.0.1:8080/__gateway/candidates
 
 # 2. 有限请求演练：只有带 X-Gateway-Release 头的请求走候选快照
 curl -H 'X-Gateway-Release: cand-1' http://127.0.0.1:8080/v1/health
-curl http://127.0.0.1:8080/__gateway/candidates
+curl http://127.0.0.1:8080/__gateway/candidates   # 查看演练计数与 readiness 状态
 
-# 3. 确认后整体切换
+# 3. 在同一组请求上对比现役配置与候选，再决定发布或放弃
+curl 'http://127.0.0.1:8080/__gateway/candidates/cand-1/diff?path=/v1/health&path=/v2/echo/ping'
+curl -X POST http://127.0.0.1:8080/__gateway/candidates/cand-1/discard
+
+# 4. 演练达标后确认，整体切换
 curl -X POST http://127.0.0.1:8080/__gateway/candidates/cand-1/confirm
 
-# 4. 回退：生成一条新的 rollback 发布记录，失败配置保留在历史中
+# 5. 回退：生成一条新的 rollback 发布记录，失败配置保留在历史中
 curl -X POST http://127.0.0.1:8080/__gateway/rollback
 curl -X POST 'http://127.0.0.1:8080/__gateway/rollback?release=rel-1'
 ```
 
-- 每个请求在入口取得一次快照；候选确认不会打断在途长响应，在途请求继续用原路由直到结束，不会把两条上游响应拼到一起。
+- 候选创建后处于 `staged`（尚未演练）状态，不能直接确认；演练中为 `rehearsing`（有请求未结束），演练结束但失败数未清零或成功数不足 `release.min_successful_rehearsals`（默认 1）时为 `insufficient`（未达到要求），只有 `ready` 才能确认。状态不是简单计数：在途演练必须先收尾，失败、取消、超时中止都计入证据。
+- 候选被修订（再次 `Stage` 且路由、上游目标、超时或重试限制发生变化）后，原候选立即变为 `superseded`，旧演练成功记录不再可用于发布，但记录保留可查；配置内容未变化时重复登记复用同一候选及其证据。
+- 放弃候选走 `/discard`，候选与演练证据以 `discarded` 状态保留，不会被删除。
+- 每个请求在入口取得一次快照并绑定；确认、回退、关闭与在途请求交错时，在途请求继续用原采用版本直到结束，不会把两条上游响应拼到一起；请求记录中的发布归属保持不变。
 - 请求记录中的 `release_id` 标明请求属于哪个发布（`rel-N`）或哪个候选（`cand-N`），上游也会收到同样的 `X-Gateway-Release` 头。
-- `GET /__gateway/releases` 返回完整发布历史（initial / promote / rollback）及当前现役发布。
+- `GET /__gateway/releases` 返回完整发布历史（initial / promote / rollback）及当前现役发布；promote 记录携带当时的演练证据（成功/失败/取消/中止计数）。
+- 确认未达标候选返回 `409` 并说明原因，未知候选返回 `404`。
 
 ## 优雅关停
 
@@ -81,4 +89,4 @@ curl http://127.0.0.1:8080/__gateway/config
 go test -race ./...
 ```
 
-内存集成测试覆盖：允许的 GET 在 503 后重试且无重复内容、POST 失败不重试、首字节后取消不拼接响应、在途请求固定使用旧快照而新请求使用新快照。
+内存集成测试覆盖：允许的 GET 在 503 后重试且无重复内容、POST 失败不重试、首字节后取消不拼接响应、在途请求固定使用旧快照而新请求使用新快照；候选未演练/演练在途/演练失败均不能发布、修订候选导致旧证据失效、放弃与差异对比、回退交错时在途请求绑定原发布且历史可追溯。

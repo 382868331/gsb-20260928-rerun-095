@@ -8,17 +8,25 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
 )
 
 type Config struct {
-	Listen       string     `json:"listen"`
-	AdminPath    string     `json:"admin_path"`
-	Upstreams    []Upstream `json:"upstreams"`
-	Routes       []Route    `json:"routes"`
-	DrainTimeout Duration   `json:"drain_timeout"`
+	Listen       string        `json:"listen"`
+	AdminPath    string        `json:"admin_path"`
+	Upstreams    []Upstream    `json:"upstreams"`
+	Routes       []Route       `json:"routes"`
+	DrainTimeout Duration      `json:"drain_timeout"`
+	Release      ReleasePolicy `json:"release"`
+}
+
+// ReleasePolicy controls the evidence a candidate must gather through
+// limited rehearsal traffic before it is allowed to become the release.
+type ReleasePolicy struct {
+	MinSuccessfulRehearsals int `json:"min_successful_rehearsals"`
 }
 
 type Duration time.Duration
@@ -59,11 +67,12 @@ type RetryPolicy struct {
 }
 
 type Snapshot struct {
-	Listen       string
-	AdminPath    string
-	DrainTimeout time.Duration
-	upstreams    map[string]*Upstream
-	routes       []matchedRoute
+	Listen                  string
+	AdminPath               string
+	DrainTimeout            time.Duration
+	minSuccessfulRehearsals int
+	upstreams               map[string]*Upstream
+	routes                  []matchedRoute
 }
 
 type matchedRoute struct {
@@ -83,6 +92,34 @@ func (s *Snapshot) DescribeRoutes() []string {
 		result = append(result, candidate.route.ID+"@"+candidate.route.Version)
 	}
 	return result
+}
+
+// MinSuccessfulRehearsals is the number of successful rehearsal requests a
+// candidate built from this snapshot needs before it may be confirmed.
+func (s *Snapshot) MinSuccessfulRehearsals() int {
+	if s.minSuccessfulRehearsals <= 0 {
+		return 1
+	}
+	return s.minSuccessfulRehearsals
+}
+
+// Routes returns the configured routes in declaration order.
+func (s *Snapshot) Routes() []Route {
+	routes := make([]Route, len(s.routes))
+	for i := range s.routes {
+		routes[i] = s.routes[i].route
+	}
+	return routes
+}
+
+// Upstreams returns the configured upstreams sorted by ID.
+func (s *Snapshot) Upstreams() []Upstream {
+	upstreams := make([]Upstream, 0, len(s.upstreams))
+	for _, upstream := range s.upstreams {
+		upstreams = append(upstreams, *upstream)
+	}
+	sort.Slice(upstreams, func(i, j int) bool { return upstreams[i].ID < upstreams[j].ID })
+	return upstreams
 }
 
 func (s *Snapshot) Match(request *http.Request) (*Match, bool) {
@@ -122,6 +159,12 @@ func (c *Config) Snapshot() (*Snapshot, error) {
 	}
 	if c.DrainTimeout == 0 {
 		c.DrainTimeout = Duration(30 * time.Second)
+	}
+	if c.Release.MinSuccessfulRehearsals == 0 {
+		c.Release.MinSuccessfulRehearsals = 1
+	}
+	if c.Release.MinSuccessfulRehearsals < 0 {
+		return nil, errors.New("release.min_successful_rehearsals must not be negative")
 	}
 	if !strings.HasPrefix(c.AdminPath, "/") {
 		return nil, errors.New("admin_path must start with /")
@@ -179,11 +222,12 @@ func (c *Config) Snapshot() (*Snapshot, error) {
 	}
 
 	return &Snapshot{
-		Listen:       c.Listen,
-		AdminPath:    path.Clean(c.AdminPath),
-		DrainTimeout: time.Duration(c.DrainTimeout),
-		upstreams:    upstreams,
-		routes:       routes,
+		Listen:                  c.Listen,
+		AdminPath:               path.Clean(c.AdminPath),
+		DrainTimeout:            time.Duration(c.DrainTimeout),
+		minSuccessfulRehearsals: c.Release.MinSuccessfulRehearsals,
+		upstreams:               upstreams,
+		routes:                  routes,
 	}, nil
 }
 

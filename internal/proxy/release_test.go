@@ -69,6 +69,11 @@ func TestCandidateRehearsalConfirmAndRollbackAttribution(t *testing.T) {
 
 	candidate := releases.Stage(hostSnapshot("new.example"))
 
+	// Confirmation before any rehearsal is rejected by the release gate.
+	if _, err := releases.Confirm(candidate.ID); err == nil {
+		t.Fatal("fresh candidate was confirmed without rehearsal")
+	}
+
 	// Normal traffic keeps using the active release.
 	if body := get(handler, "/v1/echo", nil).Body.String(); body != "old.example" {
 		t.Fatalf("active body = %q", body)
@@ -81,6 +86,9 @@ func TestCandidateRehearsalConfirmAndRollbackAttribution(t *testing.T) {
 	entries := records.Snapshot()
 	if entries[0].ReleaseID != "rel-1" || entries[1].ReleaseID != candidate.ID {
 		t.Fatalf("release attribution = %s, %s", entries[0].ReleaseID, entries[1].ReleaseID)
+	}
+	if state := releases.Candidates()[0].Readiness; !state.Ready || state.State != release.StateReady {
+		t.Fatalf("rehearsal readiness = %+v", state)
 	}
 
 	// Confirm switches all traffic to the candidate configuration.
@@ -142,8 +150,16 @@ func TestInFlightLongResponseCompletesAcrossConfirm(t *testing.T) {
 
 	// Confirm a new release while the long response is in flight.
 	candidate := releases.Stage(hostSnapshot("new.example"))
+	// A successful rehearsal must exist before the release is allowed.
+	if _, err := releases.Confirm(candidate.ID); err == nil {
+		t.Fatal("candidate confirmed without rehearsal")
+	}
+	rehearsal := get(handler, "/v1/echo", map[string]string{release.RehearsalHeader: candidate.ID})
+	if body := rehearsal.Body.String(); body != "new.example" {
+		t.Fatalf("rehearsal body = %q", body)
+	}
 	if _, err := releases.Confirm(candidate.ID); err != nil {
-		t.Fatal(err)
+		t.Fatalf("confirm after rehearsal: %v", err)
 	}
 
 	// The in-flight response keeps streaming from the old upstream only.
@@ -155,12 +171,110 @@ func TestInFlightLongResponseCompletesAcrossConfirm(t *testing.T) {
 	streamWriter.Close()
 	<-done
 
-	entry := records.Snapshot()[0]
+	var entry record.Record
+	for _, recorded := range records.Snapshot() {
+		if recorded.Path == "/v1/long" {
+			entry = recorded
+		}
+	}
 	if entry.ReleaseID != "rel-1" || entry.Error != "" || entry.Canceled || entry.Aborted {
 		t.Fatalf("in-flight entry = %+v", entry)
 	}
 	if body := get(handler, "/v1/echo", nil).Body.String(); body != "new.example" {
 		t.Fatalf("post-confirm body = %q", body)
+	}
+}
+
+// A request in flight when a rollback happens stays bound to the release
+// snapshot it entered with; the rollback only affects later requests. Both
+// releases stay present in history.
+func TestInFlightRequestPinnedAcrossRollback(t *testing.T) {
+	streamReader, streamWriter := io.Pipe()
+	newTransport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Path == "/echo" {
+			return textResponse(http.StatusOK, "new.example"), nil
+		}
+		response := textResponse(http.StatusOK, "")
+		response.Body = streamReader
+		response.ContentLength = -1
+		return response, nil
+	})
+	releases := release.NewStore(hostSnapshot("old.example"))
+	records := record.NewStore(100)
+	handler := NewWithTransport(releases, state.NewStore(), records,
+		hostTransport(map[string]http.RoundTripper{"new.example": newTransport}))
+
+	candidate := releases.Stage(hostSnapshot("new.example"))
+	if body := get(handler, "/v1/echo", map[string]string{release.RehearsalHeader: candidate.ID}).Body.String(); body != "new.example" {
+		t.Fatalf("rehearsal body = %q", body)
+	}
+	promoted, err := releases.Confirm(candidate.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	clientReader, clientWriter := io.Pipe()
+	done := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(pipeResponseWriter{writer: clientWriter}, httptest.NewRequest(http.MethodGet, "/v1/long", nil))
+		close(done)
+	}()
+	buffer := make([]byte, 64)
+	go func() { io.WriteString(streamWriter, "new-chunk\n") }()
+	if n, err := clientReader.Read(buffer); err != nil || !strings.Contains(string(buffer[:n]), "new-chunk") {
+		t.Fatalf("first read n=%d err=%v", n, err)
+	}
+
+	rolledBack, err := releases.Rollback("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go io.WriteString(streamWriter, "still-new\n")
+	if n, err := clientReader.Read(buffer); err != nil || !strings.Contains(string(buffer[:n]), "still-new") {
+		t.Fatalf("rollback switched in-flight upstream: n=%d err=%v data=%q", n, err, buffer[:n])
+	}
+	streamWriter.Close()
+	<-done
+
+	if body := get(handler, "/v1/echo", nil).Body.String(); body != "old.example" {
+		t.Fatalf("post-rollback body = %q", body)
+	}
+	var long record.Record
+	for _, recorded := range records.Snapshot() {
+		if recorded.Path == "/v1/long" {
+			long = recorded
+		}
+	}
+	if long.ReleaseID != promoted.ID {
+		t.Fatalf("in-flight release = %s, want %s", long.ReleaseID, promoted.ID)
+	}
+	if rolledBack.SourceID != "rel-1" {
+		t.Fatalf("rollback source = %s", rolledBack.SourceID)
+	}
+	if history := releases.History(); len(history) != 3 {
+		t.Fatalf("history length = %d", len(history))
+	}
+}
+
+func TestFailedRehearsalBlocksConfirm(t *testing.T) {
+	failTransport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusBadGateway,
+			Body:       io.NopCloser(strings.NewReader("boom")),
+			Header:     make(http.Header),
+		}, nil
+	})
+	releases := release.NewStore(hostSnapshot("old.example"))
+	records := record.NewStore(100)
+	failHandler := NewWithTransport(releases, state.NewStore(), records,
+		hostTransport(map[string]http.RoundTripper{"new.example": failTransport}))
+	candidate := releases.Stage(hostSnapshot("new.example"))
+	get(failHandler, "/v1/echo", map[string]string{release.RehearsalHeader: candidate.ID})
+	if readiness := releases.Candidates()[0].Readiness; readiness.Ready || readiness.Summary.Failed != 1 {
+		t.Fatalf("failed rehearsal readiness = %+v", readiness)
+	}
+	if _, err := releases.Confirm(candidate.ID); err == nil {
+		t.Fatal("candidate confirmed after failed rehearsal")
 	}
 }
 

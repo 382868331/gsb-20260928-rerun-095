@@ -2,6 +2,7 @@ package admin
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -62,11 +63,17 @@ func (a *Admin) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		})
 	case request.Method == http.MethodGet && relative == "/candidates":
 		a.writeJSON(writer, http.StatusOK, a.releases.Candidates())
+	case request.Method == http.MethodGet && strings.HasPrefix(relative, "/candidates/") && strings.HasSuffix(relative, "/diff"):
+		id := strings.TrimSuffix(strings.TrimPrefix(relative, "/candidates/"), "/diff")
+		a.handleDiff(writer, request, id)
 	case request.Method == http.MethodPost && relative == "/candidates":
 		a.handleStage(writer)
 	case request.Method == http.MethodPost && strings.HasPrefix(relative, "/candidates/") && strings.HasSuffix(relative, "/confirm"):
 		id := strings.TrimSuffix(strings.TrimPrefix(relative, "/candidates/"), "/confirm")
 		a.handleConfirm(writer, id)
+	case request.Method == http.MethodPost && strings.HasPrefix(relative, "/candidates/") && strings.HasSuffix(relative, "/discard"):
+		id := strings.TrimSuffix(strings.TrimPrefix(relative, "/candidates/"), "/discard")
+		a.handleDiscard(writer, id)
 	case request.Method == http.MethodPost && relative == "/rollback":
 		a.handleRollback(writer, request)
 	default:
@@ -89,10 +96,60 @@ func (a *Admin) handleStage(writer http.ResponseWriter) {
 func (a *Admin) handleConfirm(writer http.ResponseWriter, candidateID string) {
 	activated, err := a.confirm(candidateID)
 	if err != nil {
-		a.writeJSON(writer, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		a.writeCandidateError(writer, err)
 		return
 	}
 	a.writeJSON(writer, http.StatusOK, activated)
+}
+
+// handleDiff shows how the active release and the candidate route the same
+// set of representative requests, alongside route and limit changes. The
+// request set comes from repeated ?path= entries (GET-only by design, with
+// an optional ?method=); without them every configured prefix is compared.
+func (a *Admin) handleDiff(writer http.ResponseWriter, request *http.Request, candidateID string) {
+	paths := request.URL.Query()["path"]
+	methods := request.URL.Query()["method"]
+	requests := make([]*http.Request, 0, len(paths))
+	for i, path := range paths {
+		method := http.MethodGet
+		if i < len(methods) && methods[i] != "" {
+			method = methods[i]
+		}
+		req, err := http.NewRequest(method, path, nil)
+		if err != nil {
+			a.writeJSON(writer, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		requests = append(requests, req)
+	}
+	diff, err := a.releases.Compare(candidateID, requests)
+	if err != nil {
+		a.writeCandidateError(writer, err)
+		return
+	}
+	a.writeJSON(writer, http.StatusOK, diff)
+}
+
+func (a *Admin) handleDiscard(writer http.ResponseWriter, candidateID string) {
+	discarded, err := a.releases.Discard(candidateID)
+	if err != nil {
+		a.writeCandidateError(writer, err)
+		return
+	}
+	a.writeJSON(writer, http.StatusOK, discarded)
+}
+
+// writeCandidateError maps gating failures to 409 and unknown candidates to
+// 404 instead of hiding both behind 400.
+func (a *Admin) writeCandidateError(writer http.ResponseWriter, err error) {
+	status := http.StatusBadRequest
+	if errors.Is(err, release.ErrUnknownCandidate) {
+		status = http.StatusNotFound
+	} else {
+		// Confirmation rejections are release-gate conflicts, not bad input.
+		status = http.StatusConflict
+	}
+	a.writeJSON(writer, status, map[string]string{"error": err.Error()})
 }
 
 func (a *Admin) handleRollback(writer http.ResponseWriter, request *http.Request) {

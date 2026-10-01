@@ -124,8 +124,8 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	snapshot := p.releases.Current()
-	if strings.HasPrefix(request.URL.Path, snapshot.AdminPath) {
+	currentSnapshot := p.releases.Current()
+	if strings.HasPrefix(request.URL.Path, currentSnapshot.AdminPath) {
 		http.NotFound(writer, request)
 		return
 	}
@@ -142,7 +142,9 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	}()
 	request = request.WithContext(ctx)
 
-	snapshot, releaseID := p.releases.Select(request)
+	selection := p.releases.Select(request)
+	snapshot := selection.Snapshot
+	releaseID := selection.ID
 	entry.ReleaseID = releaseID
 	request.Header.Set(release.RehearsalHeader, releaseID)
 
@@ -152,6 +154,7 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		entry.Duration = time.Since(started)
 		entry.Error = "no route matched"
 		p.records.Add(entry)
+		p.finishRehearsal(selection.CandidateID, entry)
 		http.Error(writer, "no route matched", http.StatusNotFound)
 		return
 	}
@@ -171,7 +174,23 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	entry.Aborted = aborted
 	entry.Duration = time.Since(started)
 	p.records.Add(entry)
+	p.finishRehearsal(selection.CandidateID, entry)
 	finish(status < 500 && errText == "", errText)
+}
+
+// finishRehearsal feeds the terminal state of a rehearsal request back into
+// the candidate's evidence. Only requests pinned to a staged candidate at
+// entry are counted; normal traffic is ignored.
+func (p *Proxy) finishRehearsal(candidateID string, entry record.Record) {
+	if candidateID == "" {
+		return
+	}
+	p.releases.FinishRehearsal(candidateID, release.RehearsalOutcome{
+		Status:   entry.Status,
+		Error:    entry.Error,
+		Canceled: entry.Canceled,
+		Aborted:  entry.Aborted,
+	})
 }
 
 func (p *Proxy) forward(writer http.ResponseWriter, request *http.Request, matched *config.Match) (int, int, int64, string, bool, bool) {

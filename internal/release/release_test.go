@@ -43,15 +43,20 @@ func TestStageConfirmRollbackKeepsAuditTrail(t *testing.T) {
 	// Rehearsal traffic pinned to the candidate uses its snapshot.
 	rehearsal := httptest.NewRequest("GET", "/v1/echo", nil)
 	rehearsal.Header.Set(RehearsalHeader, candidate.ID)
-	if _, id := store.Select(rehearsal); id != candidate.ID {
-		t.Fatalf("rehearsal selected %s", id)
+	if selection := store.Select(rehearsal); selection.ID != candidate.ID {
+		t.Fatalf("rehearsal selected %s", selection.ID)
 	}
 	plain := httptest.NewRequest("GET", "/v1/echo", nil)
-	if _, id := store.Select(plain); id != "rel-1" {
-		t.Fatalf("normal traffic selected %s", id)
+	if selection := store.Select(plain); selection.ID != "rel-1" {
+		t.Fatalf("normal traffic selected %s", selection.ID)
 	}
-	if got := store.Candidates()[0].RehearsalRequests; got != 1 {
-		t.Fatalf("rehearsal requests = %d", got)
+	store.FinishRehearsal(candidate.ID, RehearsalOutcome{Status: 200})
+	listed := store.Candidates()[0]
+	if got := listed.Rehearsal.InFlight; got != 0 {
+		t.Fatalf("rehearsal in flight = %d", got)
+	}
+	if got := listed.Rehearsal.Succeeded; got != 1 {
+		t.Fatalf("successful rehearsals = %d", got)
 	}
 
 	promoted, err := store.Confirm(candidate.ID)
@@ -64,8 +69,9 @@ func TestStageConfirmRollbackKeepsAuditTrail(t *testing.T) {
 	if got := store.CurrentID(); got != promoted.ID {
 		t.Fatalf("active release = %s", got)
 	}
-	if len(store.Candidates()) != 0 {
-		t.Fatal("confirmed candidate still staged")
+	confirmedList := store.Candidates()
+	if len(confirmedList) != 1 || confirmedList[0].State != StateConfirmed {
+		t.Fatalf("confirmed candidate not archived as confirmed: %+v", confirmedList)
 	}
 
 	// Rollback creates a new release record instead of erasing the failed one.
@@ -83,17 +89,29 @@ func TestStageConfirmRollbackKeepsAuditTrail(t *testing.T) {
 	if history[1].ID != promoted.ID {
 		t.Fatal("failed release was erased from history")
 	}
-	if _, id := store.Select(plain); id != rolledBack.ID {
-		t.Fatalf("after rollback selected %s", id)
+	if selection := store.Select(plain); selection.ID != rolledBack.ID {
+		t.Fatalf("after rollback selected %s", selection.ID)
 	}
 }
 
 func TestRollbackToExplicitRelease(t *testing.T) {
 	store := NewStore(testSnapshot("v1"))
+	requireRehearsal := func(id string) {
+		request := httptest.NewRequest("GET", "/v1/echo", nil)
+		request.Header.Set(RehearsalHeader, id)
+		selection := store.Select(request)
+		store.FinishRehearsal(selection.CandidateID, RehearsalOutcome{Status: 200})
+	}
 	first := store.Stage(testSnapshot("v2"))
+	requireRehearsal(first.ID)
 	second := store.Stage(testSnapshot("v3"))
-	if _, err := store.Confirm(first.ID); err != nil {
-		t.Fatal(err)
+	requireRehearsal(second.ID)
+	// The v3 revision supersedes v2, so v2 must no longer be confirmable.
+	if _, err := store.Confirm(first.ID); err == nil {
+		t.Fatal("superseded candidate was confirmed")
+	}
+	if state := store.Candidates()[0]; state.State != StateSuperseded {
+		t.Fatalf("superseded state = %s", state.State)
 	}
 	if _, err := store.Confirm(second.ID); err != nil {
 		t.Fatal(err)
@@ -117,5 +135,121 @@ func TestUnknownCandidateAndReleaseErrors(t *testing.T) {
 	}
 	if _, err := store.Rollback(""); err == nil {
 		t.Fatal("rollback without earlier release succeeded")
+	}
+}
+
+// A brand new candidate, an in-flight rehearsal or a failed rehearsal are
+// distinct non-releasable states; none may skip the release gate.
+func TestConfirmRequiresPassedRehearsal(t *testing.T) {
+	store := NewStore(testSnapshot("v1"))
+	candidate := store.Stage(testSnapshot("v2"))
+
+	if _, err := store.Confirm(candidate.ID); err == nil {
+		t.Fatal("fresh candidate was confirmed without rehearsal")
+	}
+	if readiness := store.Candidates()[0].Readiness; readiness.State != StateInsufficient || readiness.Ready {
+		t.Fatalf("fresh readiness = %+v", readiness)
+	}
+
+	request := httptest.NewRequest("GET", "/v1/echo", nil)
+	request.Header.Set(RehearsalHeader, candidate.ID)
+	selection := store.Select(request)
+	if readiness := store.Candidates()[0].Readiness; readiness.State != StateRehearsing || readiness.Ready {
+		t.Fatalf("in-flight readiness = %+v", readiness)
+	}
+	if _, err := store.Confirm(selection.CandidateID); err == nil {
+		t.Fatal("candidate confirmed while rehearsal in flight")
+	}
+	store.FinishRehearsal(selection.CandidateID, RehearsalOutcome{Status: 502, Error: "bad gateway"})
+	if readiness := store.Candidates()[0].Readiness; readiness.State != StateInsufficient || readiness.Summary.Failed != 1 {
+		t.Fatalf("failed readiness = %+v", readiness)
+	}
+	if _, err := store.Confirm(candidate.ID); err == nil {
+		t.Fatal("candidate with failed rehearsal was confirmed")
+	}
+
+	request = httptest.NewRequest("GET", "/v1/echo", nil)
+	request.Header.Set(RehearsalHeader, candidate.ID)
+	selection = store.Select(request)
+	store.FinishRehearsal(selection.CandidateID, RehearsalOutcome{Status: 200})
+	activated, err := store.Confirm(candidate.ID)
+	if err != nil {
+		t.Fatalf("confirm after success: %v", err)
+	}
+	if activated.Rehearsal == nil || activated.Rehearsal.Failed != 1 || activated.Rehearsal.Succeeded != 1 {
+		t.Fatalf("release record lost rehearsal evidence: %+v", activated.Rehearsal)
+	}
+	listed, err := store.Candidate(candidate.ID)
+	if err != nil || listed.State != StateConfirmed {
+		t.Fatalf("confirmed candidate not retained: %+v err=%v", listed, err)
+	}
+}
+
+// A revision that changes routing invalidates evidence gathered against the
+// earlier candidate, even though the older rehearsal had passed.
+func TestRevisionInvalidatesEvidence(t *testing.T) {
+	store := NewStore(testSnapshot("v1"))
+	first := store.Stage(testSnapshot("v2"))
+	request := httptest.NewRequest("GET", "/v1/echo", nil)
+	request.Header.Set(RehearsalHeader, first.ID)
+	selection := store.Select(request)
+	store.FinishRehearsal(selection.CandidateID, RehearsalOutcome{Status: 200})
+	if !store.Candidates()[0].Readiness.Ready {
+		t.Fatal("first candidate should be ready before revision")
+	}
+
+	store.Stage(testSnapshot("v3"))
+	firstState, err := store.Candidate(first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstState.State != StateSuperseded || firstState.Readiness.Ready {
+		t.Fatalf("superseded candidate still releasable: %+v", firstState)
+	}
+	if firstState.Rehearsal.Succeeded != 1 {
+		t.Fatal("superseding erased rehearsal evidence")
+	}
+	if _, err := store.Confirm(first.ID); err == nil {
+		t.Fatal("superseded candidate was confirmed")
+	}
+}
+
+// Re-staging an unchanged snapshot reuses the staged revision and keeps its
+// rehearsal evidence.
+func TestUnchangedRestageKeepsEvidence(t *testing.T) {
+	store := NewStore(testSnapshot("v1"))
+	first := store.Stage(testSnapshot("v2"))
+	request := httptest.NewRequest("GET", "/v1/echo", nil)
+	request.Header.Set(RehearsalHeader, first.ID)
+	selection := store.Select(request)
+	store.FinishRehearsal(selection.CandidateID, RehearsalOutcome{Status: 200})
+
+	again := store.Stage(testSnapshot("v2"))
+	if again.ID != first.ID {
+		t.Fatalf("unchanged restage created %s, want %s", again.ID, first.ID)
+	}
+	if !again.Readiness.Ready {
+		t.Fatal("unchanged restage lost rehearsal evidence")
+	}
+}
+
+func TestDiscardKeepsTrailAndBlocksConfirm(t *testing.T) {
+	store := NewStore(testSnapshot("v1"))
+	candidate := store.Stage(testSnapshot("v2"))
+	discarded, err := store.Discard(candidate.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if discarded.State != StateDiscarded {
+		t.Fatalf("discarded state = %s", discarded.State)
+	}
+	if _, err := store.Confirm(candidate.ID); err == nil {
+		t.Fatal("discarded candidate was confirmed")
+	}
+	if _, err := store.Discard(candidate.ID); err == nil {
+		t.Fatal("discarding a resolved candidate succeeded")
+	}
+	if got := len(store.Candidates()); got != 1 {
+		t.Fatalf("candidate history length = %d", got)
 	}
 }
