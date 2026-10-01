@@ -103,6 +103,22 @@ func main() {
 		log.Printf("staged candidate %s routes=%v", candidate.ID, candidate.Routes)
 		return candidate, nil
 	}
+	revise := func(candidateID string) (release.Candidate, bool, error) {
+		snapshot, err := loadSnapshot(*configPath)
+		if err != nil {
+			return release.Candidate{}, false, err
+		}
+		candidate, invalidated, err := releases.Revise(candidateID, snapshot)
+		if err != nil {
+			return release.Candidate{}, false, err
+		}
+		if invalidated {
+			log.Printf("revised candidate %s to revision %d; prior rehearsal evidence invalidated routes=%v", candidate.ID, candidate.Revision, candidate.Routes)
+		} else {
+			log.Printf("candidate %s unchanged on disk; rehearsal evidence kept", candidate.ID)
+		}
+		return candidate, invalidated, nil
+	}
 	confirm := func(candidateID string) (release.Release, error) {
 		activated, err := releases.Confirm(candidateID)
 		if err != nil {
@@ -125,7 +141,21 @@ func main() {
 		log.Printf("rolled back to %s as new release %s", activated.SourceID, activated.ID)
 		return activated, nil
 	}
-	adminAPI = admin.New(releases, upstreams, records, stage, confirm, rollback)
+	discard := func(candidateID string) (release.CandidateRecord, error) {
+		record, err := releases.Discard(candidateID)
+		if err != nil {
+			return release.CandidateRecord{}, err
+		}
+		log.Printf("discarded candidate %s at revision %d", record.ID, record.Revision)
+		return record, nil
+	}
+	diffConfig := func(candidateID string) (release.SnapshotDiff, error) {
+		return releases.DiffSnapshot(candidateID)
+	}
+	diffRequest := func(candidateID, method, requestPath string) (release.RequestDiff, error) {
+		return releases.DiffRequest(candidateID, method, requestPath)
+	}
+	adminAPI = admin.New(releases, upstreams, records, stage, revise, confirm, discard, rollback, diffConfig, diffRequest)
 
 	if err := ensureListener(); err != nil {
 		log.Fatal(err)

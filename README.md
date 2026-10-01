@@ -36,7 +36,7 @@ curl -i http://127.0.0.1:8080/v1/flaky
 
 ## 候选发布与回退
 
-配置更新走可审查的候选发布流程，每次激活都留下不可篡改的发布记录：
+配置更新走可审查的候选发布流程，有限演练是真正的发布条件，每次激活都留下不可篡改的发布记录：
 
 ```bash
 # 1. 修改配置文件后，把新配置登记为候选（独立校验，失败不影响现役配置）
@@ -45,19 +45,33 @@ curl -X POST http://127.0.0.1:8080/__gateway/candidates
 
 # 2. 有限请求演练：只有带 X-Gateway-Release 头的请求走候选快照
 curl -H 'X-Gateway-Release: cand-1' http://127.0.0.1:8080/v1/health
+# 至少完成 release.min_successful_rehearsals 次 2xx/3xx 演练（默认 1，示例配置为 2）
 curl http://127.0.0.1:8080/__gateway/candidates
 
-# 3. 确认后整体切换
+# 2b. 在发布或放弃前，对比现役配置与候选在同一组请求上的差异
+curl -X POST 'http://127.0.0.1:8080/__gateway/candidates/cand-1/diff'                 # 整份配置差异
+curl -X POST 'http://127.0.0.1:8080/__gateway/candidates/cand-1/diff?path=/v1/health'  # 同一请求的路由/限流决策差异
+
+# 3. 确认后整体切换（演练未完成或未达标会被拒绝，返回 409 和明确状态）
 curl -X POST http://127.0.0.1:8080/__gateway/candidates/cand-1/confirm
+
+# 3b. 修改配置后把候选修订到新内容；路由或限制一旦改变，旧演练成功记录立即失效，需要重新演练
+curl -X POST http://127.0.0.1:8080/__gateway/candidates/cand-1/revise
+
+# 3c. 放弃候选（不影响现役配置；候选与演练历史仍可在归档中追溯）
+curl -X POST http://127.0.0.1:8080/__gateway/candidates/cand-1/discard
 
 # 4. 回退：生成一条新的 rollback 发布记录，失败配置保留在历史中
 curl -X POST http://127.0.0.1:8080/__gateway/rollback
 curl -X POST 'http://127.0.0.1:8080/__gateway/rollback?release=rel-1'
 ```
 
-- 每个请求在入口取得一次快照；候选确认不会打断在途长响应，在途请求继续用原路由直到结束，不会把两条上游响应拼到一起。
-- 请求记录中的 `release_id` 标明请求属于哪个发布（`rel-N`）或哪个候选（`cand-N`），上游也会收到同样的 `X-Gateway-Release` 头。
-- `GET /__gateway/releases` 返回完整发布历史（initial / promote / rollback）及当前现役发布。
+- 演练门槛有四种明确状态：`not_rehearsed`（完全没演练）、`in_progress`（有演练请求尚未结束）、`incomplete_results`（全部结束但成功数/结果不达标）、`ready`（可以发布）。取消（499）、中止、5xx、无路由都不算成功演练。
+- 候选配置指纹覆盖监听地址、上游、路由顺序/匹配/去前缀/重试策略；`revise` 发现指纹变化时修订号加一并把旧证据归档到 `invalidated_evidence`，新修订必须重新演练。
+- 每个请求在入口取得一次快照并与当时采用的版本（发布 ID 或候选 ID + 修订号）绑定；确认、回退、放弃、关停都不会改变在途请求的版本，在途请求继续用原路由直到结束，不会把两条上游响应拼到一起。
+- 请求记录中的 `release_id` 标明请求属于哪个发布（`rel-N`）或哪个候选（`cand-N`），`candidate_revision` 标明候选修订号；上游也会收到同样的 `X-Gateway-Release` 头。
+- `GET /__gateway/releases` 返回完整发布历史（initial / promote / rollback）及当前现役发布；promote 记录内嵌发布时的演练证据汇总。
+- `GET /__gateway/candidates` 同时返回在役候选（含每次演练结果明细）和归档（已发布 / 已放弃 / 各失效修订的证据汇总），历史演练与发布记录始终可追溯。
 
 ## 优雅关停
 
@@ -81,4 +95,4 @@ curl http://127.0.0.1:8080/__gateway/config
 go test -race ./...
 ```
 
-内存集成测试覆盖：允许的 GET 在 503 后重试且无重复内容、POST 失败不重试、首字节后取消不拼接响应、在途请求固定使用旧快照而新请求使用新快照。
+内存集成测试覆盖：允许的 GET 在 503 后重试且无重复内容、POST 失败不重试、首字节后取消不拼接响应、在途请求固定使用旧快照而新请求使用新快照；候选在未演练/演练在途/演练失败时确认被拒（409）、修订后旧演练证据失效、同请求差异对比，以及放弃与发布归档可追溯。

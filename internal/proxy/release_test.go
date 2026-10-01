@@ -83,7 +83,8 @@ func TestCandidateRehearsalConfirmAndRollbackAttribution(t *testing.T) {
 		t.Fatalf("release attribution = %s, %s", entries[0].ReleaseID, entries[1].ReleaseID)
 	}
 
-	// Confirm switches all traffic to the candidate configuration.
+	// Confirm switches all traffic to the candidate configuration. The
+	// completed rehearsal above satisfied the release gate.
 	if _, err := releases.Confirm(candidate.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -124,6 +125,13 @@ func TestInFlightLongResponseCompletesAcrossConfirm(t *testing.T) {
 	handler := NewWithTransport(releases, state.NewStore(), records,
 		hostTransport(map[string]http.RoundTripper{"old.example": oldTransport}))
 
+	// A completed successful rehearsal on the candidate satisfies the gate
+	// before the long (old-release) response starts streaming.
+	candidate := releases.Stage(hostSnapshot("new.example"))
+	if body := get(handler, "/v1/echo", map[string]string{release.RehearsalHeader: candidate.ID}).Body.String(); body != "new.example" {
+		t.Fatalf("rehearsal body = %q", body)
+	}
+
 	clientReader, clientWriter := io.Pipe()
 	done := make(chan struct{})
 	go func() {
@@ -141,7 +149,6 @@ func TestInFlightLongResponseCompletesAcrossConfirm(t *testing.T) {
 	}
 
 	// Confirm a new release while the long response is in flight.
-	candidate := releases.Stage(hostSnapshot("new.example"))
 	if _, err := releases.Confirm(candidate.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +162,7 @@ func TestInFlightLongResponseCompletesAcrossConfirm(t *testing.T) {
 	streamWriter.Close()
 	<-done
 
-	entry := records.Snapshot()[0]
+	entry := records.Snapshot()[1]
 	if entry.ReleaseID != "rel-1" || entry.Error != "" || entry.Canceled || entry.Aborted {
 		t.Fatalf("in-flight entry = %+v", entry)
 	}

@@ -2,6 +2,9 @@
   "listen": "127.0.0.1:8080",
   "admin_path": "/__gateway",
   "drain_timeout": "30s",
+  "release": {
+    "min_successful_rehearsals": 2
+  },
   "upstreams": [
     {
       "id": "local-v1",

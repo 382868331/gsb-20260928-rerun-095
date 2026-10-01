@@ -124,8 +124,8 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	snapshot := p.releases.Current()
-	if strings.HasPrefix(request.URL.Path, snapshot.AdminPath) {
+	activeSnapshot := p.releases.Current()
+	if strings.HasPrefix(request.URL.Path, activeSnapshot.AdminPath) {
 		http.NotFound(writer, request)
 		return
 	}
@@ -142,9 +142,41 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	}()
 	request = request.WithContext(ctx)
 
-	snapshot, releaseID := p.releases.Select(request)
+	binding := p.releases.Select(request)
+	snapshot := binding.Snapshot
+	releaseID := binding.ID
 	entry.ReleaseID = releaseID
+	if binding.IsCandidate {
+		entry.CandidateRevision = binding.Revision
+	}
 	request.Header.Set(release.RehearsalHeader, releaseID)
+	// Rehearsal requests are counted as in-flight by Select; regardless of how
+	// the request ends (no route, upstream failure, success, shutdown) the
+	// candidate gate receives exactly one terminal outcome.
+	rehearsalReported := false
+	finishRehearsal := func(status, attempts int, errText string, canceled, aborted bool) {
+		if !binding.IsCandidate || rehearsalReported {
+			return
+		}
+		rehearsalReported = true
+		p.releases.FinishRehearsal(binding.ID, binding.Revision, release.RehearsalOutcome{
+			RecordID: entry.ID,
+			At:       time.Now(),
+			Method:   request.Method,
+			Path:     request.URL.Path,
+			Status:   status,
+			Attempts: attempts,
+			Success:  status > 0 && status < 400 && errText == "" && !canceled && !aborted,
+			Canceled: canceled,
+			Aborted:  aborted,
+			Error:    errText,
+		})
+	}
+	defer func() {
+		if binding.IsCandidate && !rehearsalReported {
+			finishRehearsal(entry.Status, entry.Attempts, entry.Error, entry.Canceled, entry.Aborted)
+		}
+	}()
 
 	matched, ok := snapshot.Match(request)
 	if !ok {
@@ -152,6 +184,7 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		entry.Duration = time.Since(started)
 		entry.Error = "no route matched"
 		p.records.Add(entry)
+		finishRehearsal(entry.Status, entry.Attempts, entry.Error, false, false)
 		http.Error(writer, "no route matched", http.StatusNotFound)
 		return
 	}
@@ -171,6 +204,7 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	entry.Aborted = aborted
 	entry.Duration = time.Since(started)
 	p.records.Add(entry)
+	finishRehearsal(status, attempts, errText, canceled, aborted)
 	finish(status < 500 && errText == "", errText)
 }
 

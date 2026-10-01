@@ -6,24 +6,25 @@ import (
 )
 
 type Record struct {
-	ID            string        `json:"id"`
-	StartedAt     time.Time     `json:"started_at"`
-	Duration      time.Duration `json:"duration"`
-	RouteID       string        `json:"route_id"`
-	ReleaseID     string        `json:"release_id"`
-	Version       string        `json:"version"`
-	UpstreamID    string        `json:"upstream_id"`
-	Method        string        `json:"method"`
-	Path          string        `json:"path"`
-	Query         string        `json:"query,omitempty"`
-	Status        int           `json:"status"`
-	Attempts      int           `json:"attempts"`
-	BytesIn       int64         `json:"bytes_in"`
-	BytesOut      int64         `json:"bytes_out"`
-	ClientAddress string        `json:"client_address"`
-	Error         string        `json:"error,omitempty"`
-	Canceled      bool          `json:"canceled"`
-	Aborted       bool          `json:"aborted"`
+	ID                string        `json:"id"`
+	StartedAt         time.Time     `json:"started_at"`
+	Duration          time.Duration `json:"duration"`
+	RouteID           string        `json:"route_id"`
+	ReleaseID         string        `json:"release_id"`
+	CandidateRevision int           `json:"candidate_revision,omitempty"`
+	Version           string        `json:"version"`
+	UpstreamID        string        `json:"upstream_id"`
+	Method            string        `json:"method"`
+	Path              string        `json:"path"`
+	Query             string        `json:"query,omitempty"`
+	Status            int           `json:"status"`
+	Attempts          int           `json:"attempts"`
+	BytesIn           int64         `json:"bytes_in"`
+	BytesOut          int64         `json:"bytes_out"`
+	ClientAddress     string        `json:"client_address"`
+	Error             string        `json:"error,omitempty"`
+	Canceled          bool          `json:"canceled"`
+	Aborted           bool          `json:"aborted"`
 }
 
 type Store struct {

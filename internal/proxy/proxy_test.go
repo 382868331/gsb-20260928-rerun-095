@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -105,8 +106,9 @@ func TestCancelAfterFirstByteDoesNotSpliceAnotherResponse(t *testing.T) {
 func TestInFlightRequestKeepsOldSnapshot(t *testing.T) {
 	reachedOld := make(chan struct{})
 	releaseOld := make(chan struct{})
+	var reachedOnce sync.Once
 	oldTransport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
-		close(reachedOld)
+		reachedOnce.Do(func() { close(reachedOld) })
 		<-releaseOld
 		return textResponse(http.StatusOK, "old-upstream"), nil
 	})
@@ -125,7 +127,19 @@ func TestInFlightRequestKeepsOldSnapshot(t *testing.T) {
 		firstDone <- *destination
 	}()
 	<-reachedOld
-	candidate := releases.Stage(mustSnapshot(t))
+	candidate := releases.Stage(mustCandidateSnapshot(t, "candidate.example"))
+	// Satisfy the rehearsal gate with a separate candidate request while the
+	// first request stays blocked on the old upstream.
+	rehearsal := httptest.NewRequest(http.MethodGet, "/v1/echo/ping", nil)
+	rehearsal.Header.Set(release.RehearsalHeader, candidate.ID)
+	rehearsalRecorder := httptest.NewRecorder()
+	gatewayRehearsal := NewWithTransport(releases, state.NewStore(), record.NewStore(10), roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return textResponse(http.StatusOK, "candidate-upstream"), nil
+	}))
+	gatewayRehearsal.ServeHTTP(rehearsalRecorder, rehearsal)
+	if rehearsalRecorder.Code != http.StatusOK {
+		t.Fatalf("rehearsal status = %d", rehearsalRecorder.Code)
+	}
 	if _, err := releases.Confirm(candidate.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -198,6 +212,32 @@ func mustSnapshot(t testing.TB) *config.Snapshot {
 			t.Fatal(err)
 		}
 		panic(err)
+	}
+	return snapshot
+}
+
+func mustCandidateSnapshot(t testing.TB, host string) *config.Snapshot {
+	cfg := &config.Config{
+		Listen:    "127.0.0.1:0",
+		AdminPath: "/__gateway",
+		Upstreams: []config.Upstream{{ID: "candidate", BaseURL: "http://" + host, Timeout: config.Duration(5 * time.Second)}},
+		Routes: []config.Route{{
+			ID:          "v1",
+			Version:     "v2",
+			Prefix:      "/v1/",
+			UpstreamID:  "candidate",
+			StripPrefix: true,
+			Retry: config.RetryPolicy{
+				Methods:        []string{http.MethodGet, http.MethodHead},
+				MaxAttempts:    2,
+				RetryOnStatus:  []int{http.StatusServiceUnavailable, http.StatusBadGateway, http.StatusGatewayTimeout},
+				RetryOnConnect: true,
+			},
+		}},
+	}
+	snapshot, err := cfg.Snapshot()
+	if err != nil {
+		t.Fatal(err)
 	}
 	return snapshot
 }
