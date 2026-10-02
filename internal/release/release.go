@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,6 +33,9 @@ type CandidateState string
 const (
 	// StateStaged: no rehearsal has happened yet.
 	StateStaged CandidateState = "staged"
+	// StatePlanPending: the coverage plan exists but has not been
+	// acknowledged before rehearsal start.
+	StatePlanPending CandidateState = "plan_pending"
 	// StateRehearsing: at least one rehearsal is still in flight.
 	StateRehearsing CandidateState = "rehearsing"
 	// StateInsufficient: rehearsals finished but did not meet the
@@ -54,6 +58,9 @@ var (
 	// ErrNotStaged is returned when an operation needs a staged candidate
 	// but the candidate has already been resolved.
 	ErrNotStaged = errors.New("candidate is no longer staged")
+	// ErrPlanPending rejects rehearsal traffic before the coverage plan was
+	// acknowledged.
+	ErrPlanPending = errors.New("coverage plan has not been acknowledged")
 )
 
 // RehearsalSummary is the accumulated evidence gathered by rehearsal traffic.
@@ -72,6 +79,7 @@ type Readiness struct {
 	Ready   bool             `json:"ready"`
 	Reason  string           `json:"reason,omitempty"`
 	Summary RehearsalSummary `json:"summary"`
+	Reasons []string         `json:"reasons,omitempty"`
 }
 
 // Release is an immutable audit record of one activation. Rollbacks append a
@@ -84,6 +92,7 @@ type Release struct {
 	Routes      []string          `json:"routes"`
 	Fingerprint string            `json:"fingerprint"`
 	Rehearsal   *RehearsalSummary `json:"rehearsal,omitempty"`
+	Coverage    *CoverageBasis    `json:"coverage,omitempty"`
 
 	snapshot *config.Snapshot
 }
@@ -92,24 +101,41 @@ type Release struct {
 // until it is confirmed, discarded, superseded or promoted. Candidates are
 // never deleted so the full rehearsal and release trail stays auditable.
 type Candidate struct {
-	ID          string           `json:"id"`
-	CreatedAt   time.Time        `json:"created_at"`
-	ResolvedAt  time.Time        `json:"resolved_at,omitempty"`
-	State       CandidateState   `json:"state"`
-	Routes      []string         `json:"routes"`
-	Fingerprint string           `json:"fingerprint"`
-	Rehearsal   RehearsalSummary `json:"rehearsal"`
-	Readiness   Readiness        `json:"readiness"`
+	ID            string           `json:"id"`
+	CreatedAt     time.Time        `json:"created_at"`
+	ResolvedAt    time.Time        `json:"resolved_at,omitempty"`
+	State         CandidateState   `json:"state"`
+	Routes        []string         `json:"routes"`
+	Fingerprint   string           `json:"fingerprint"`
+	Rehearsal     RehearsalSummary `json:"rehearsal"`
+	Readiness     Readiness        `json:"readiness"`
+	SupersededBy  string           `json:"superseded_by,omitempty"`
+	InvalidReason string           `json:"invalid_reason,omitempty"`
 
-	snapshot *config.Snapshot
+	snapshot         *config.Snapshot
+	plan             *config.CoveragePlan
+	planAcknowledged bool
+	planAckAt        time.Time
+	planAckSource    string
+	evidence         []Evidence
+	seenSamples      map[string]struct{}
+	supplements      []*SupplementBatch
+	supplementOpen   map[string]int
+	supplementSeq    int
 }
 
 // RehearsalOutcome reports how one pinned rehearsal request ended.
 type RehearsalOutcome struct {
-	Status   int
-	Error    string
-	Canceled bool
-	Aborted  bool
+	Status     int
+	Error      string
+	Canceled   bool
+	Aborted    bool
+	Method     string
+	Path       string
+	Header     http.Header
+	RequestID  string
+	SampleID   string
+	Supplement string
 }
 
 type Store struct {
@@ -125,7 +151,7 @@ type Store struct {
 func NewStore(snapshot *config.Snapshot) *Store {
 	store := &Store{candidates: make(map[string]*Candidate)}
 	store.active = snapshot
-	initial := store.appendReleaseLocked(KindInitial, "", snapshot, nil)
+	initial := store.appendReleaseLocked(KindInitial, "", snapshot, nil, nil)
 	store.activeID = initial.ID
 	return store
 }
@@ -147,6 +173,11 @@ type Selection struct {
 	Snapshot    *config.Snapshot
 	ID          string
 	CandidateID string
+	// PlanPending is true when the header names a staged candidate whose
+	// coverage plan still needs explicit acknowledgement; the request must
+	// not be served by that candidate.
+	PlanPending bool
+	Supplement  string
 }
 
 // Select picks the snapshot for one request: rehearsal traffic pinned to a
@@ -158,8 +189,19 @@ func (s *Store) Select(request *http.Request) Selection {
 	defer s.mu.Unlock()
 	if id := request.Header.Get(RehearsalHeader); id != "" {
 		if candidate, ok := s.candidates[id]; ok && candidate.State == StateStaged {
+			if candidate.plan != nil && !candidate.planAcknowledged {
+				return Selection{Snapshot: s.active, ID: s.activeID, CandidateID: candidate.ID, PlanPending: true}
+			}
+			supplement := request.Header.Get(SupplementHeader)
+			if supplement != "" {
+				if _, ok := candidate.supplementOpen[supplement]; !ok {
+					// Unknown or closed batches must not silently serve the
+					// candidate: fall back to the active release instead.
+					return Selection{Snapshot: s.active, ID: s.activeID}
+				}
+			}
 			candidate.Rehearsal.InFlight++
-			return Selection{Snapshot: candidate.snapshot, ID: candidate.ID, CandidateID: candidate.ID}
+			return Selection{Snapshot: candidate.snapshot, ID: candidate.ID, CandidateID: candidate.ID, Supplement: supplement}
 		}
 	}
 	return Selection{Snapshot: s.active, ID: s.activeID}
@@ -179,15 +221,80 @@ func (s *Store) FinishRehearsal(candidateID string, outcome RehearsalOutcome) {
 	if candidate.Rehearsal.InFlight > 0 {
 		candidate.Rehearsal.InFlight--
 	}
+	sampleKey := outcome.SampleID
+	if sampleKey == "" {
+		sampleKey = outcome.RequestID
+	}
+	duplicate := false
+	if sampleKey != "" {
+		if candidate.seenSamples == nil {
+			candidate.seenSamples = map[string]struct{}{}
+		}
+		if _, seen := candidate.seenSamples[sampleKey]; seen {
+			duplicate = true
+		}
+	}
+	result := classifyOutcome(outcome)
+	categories := matchCategories(candidate.plan, outcome.Method, outcome.Path, outcome.Header)
+	evidence := Evidence{
+		RequestID:    outcome.RequestID,
+		SampleID:     outcome.SampleID,
+		Method:       outcome.Method,
+		Path:         outcome.Path,
+		Status:       outcome.Status,
+		Outcome:      result,
+		Valid:        result == OutcomeValid && len(categories) > 0,
+		Duplicate:    duplicate,
+		Categories:   categories,
+		SupplementID: outcome.Supplement,
+		RecordedAt:   time.Now(),
+	}
+	if outcome.Supplement != "" {
+		if index, ok := candidate.supplementOpen[outcome.Supplement]; ok {
+			batch := candidate.supplements[index]
+			evidence.Source = batch.Source
+			switch {
+			case duplicate:
+				batch.Duplicates++
+			case evidence.Valid:
+				batch.Valid++
+			case result == OutcomeFailed:
+				batch.Failed++
+			case result == OutcomeCanceled:
+				batch.Canceled++
+			case result == OutcomeAborted:
+				batch.Aborted++
+			}
+		}
+	}
+	if !duplicate {
+		if sampleKey != "" {
+			candidate.seenSamples[sampleKey] = struct{}{}
+		}
+		switch result {
+		case OutcomeValid:
+			candidate.Rehearsal.Succeeded++
+		case OutcomeFailed:
+			candidate.Rehearsal.Failed++
+		case OutcomeCanceled:
+			candidate.Rehearsal.Canceled++
+		case OutcomeAborted:
+			candidate.Rehearsal.Aborted++
+		}
+	}
+	candidate.evidence = append(candidate.evidence, evidence)
+}
+
+func classifyOutcome(outcome RehearsalOutcome) EvidenceOutcome {
 	switch {
 	case outcome.Aborted:
-		candidate.Rehearsal.Aborted++
+		return OutcomeAborted
 	case outcome.Canceled:
-		candidate.Rehearsal.Canceled++
+		return OutcomeCanceled
 	case outcome.Error != "" || outcome.Status == 0 || outcome.Status >= http.StatusInternalServerError:
-		candidate.Rehearsal.Failed++
+		return OutcomeFailed
 	default:
-		candidate.Rehearsal.Succeeded++
+		return OutcomeValid
 	}
 }
 
@@ -201,6 +308,8 @@ func (s *Store) Stage(snapshot *config.Snapshot) Candidate {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	fingerprint := Fingerprint(snapshot)
+	s.candSeq++
+	revision := fmt.Sprintf("cand-%d", s.candSeq)
 	for _, existing := range s.candidates {
 		if existing.State != StateStaged {
 			continue
@@ -212,10 +321,11 @@ func (s *Store) Stage(snapshot *config.Snapshot) Candidate {
 		}
 		existing.State = StateSuperseded
 		existing.ResolvedAt = time.Now()
+		existing.SupersededBy = revision
+		existing.InvalidReason = s.supersedeReasonLocked(existing, snapshot)
 	}
-	s.candSeq++
 	candidate := &Candidate{
-		ID:          fmt.Sprintf("cand-%d", s.candSeq),
+		ID:          revision,
 		CreatedAt:   time.Now(),
 		State:       StateStaged,
 		Routes:      snapshot.DescribeRoutes(),
@@ -223,7 +333,10 @@ func (s *Store) Stage(snapshot *config.Snapshot) Candidate {
 		Rehearsal: RehearsalSummary{
 			RequiredSuccesses: int64(snapshot.MinSuccessfulRehearsals()),
 		},
-		snapshot: snapshot,
+		snapshot:       snapshot,
+		plan:           snapshot.CoveragePlan(),
+		seenSamples:    map[string]struct{}{},
+		supplementOpen: map[string]int{},
 	}
 	s.candidates[candidate.ID] = candidate
 	return *candidate
@@ -241,12 +354,23 @@ func (s *Store) Confirm(candidateID string) (Release, error) {
 		return Release{}, fmt.Errorf("%w %q", ErrUnknownCandidate, candidateID)
 	}
 	if readiness := candidate.readinessLocked(); !readiness.Ready {
-		return Release{}, fmt.Errorf("candidate %q cannot be confirmed: %s", candidateID, readiness.Reason)
+		return Release{}, fmt.Errorf("candidate %q cannot be confirmed: %s%s", candidateID, readiness.Reason,
+			func() string {
+				if len(readiness.Reasons) == 0 {
+					return ""
+				}
+				return ": " + strings.Join(readiness.Reasons, "; ")
+			}())
 	}
 	summary := candidate.Rehearsal
 	candidate.State = StateConfirmed
 	candidate.ResolvedAt = time.Now()
-	release := s.appendReleaseLocked(KindPromote, candidate.ID, candidate.snapshot, &summary)
+	var basis *CoverageBasis
+	if candidate.plan != nil {
+		b := buildReport(candidate, s.active)
+		basis = &CoverageBasis{Overall: b.Overall, Plan: b.Plan, Category: b.Categories, Evidence: b.Evidence}
+	}
+	release := s.appendReleaseLocked(KindPromote, candidate.ID, candidate.snapshot, &summary, basis)
 	s.active = candidate.snapshot
 	s.activeID = release.ID
 	return release, nil
@@ -322,7 +446,7 @@ func (s *Store) Rollback(targetID string) (Release, error) {
 		}
 		return Release{}, fmt.Errorf("unknown release %q", targetID)
 	}
-	release := s.appendReleaseLocked(KindRollback, target.ID, target.snapshot, nil)
+	release := s.appendReleaseLocked(KindRollback, target.ID, target.snapshot, nil, nil)
 	s.active = target.snapshot
 	s.activeID = release.ID
 	return release, nil
@@ -356,6 +480,9 @@ func (c *Candidate) readinessLocked() Readiness {
 	switch c.State {
 	case StateStaged:
 		switch {
+		case c.plan != nil && !c.planAcknowledged:
+			readiness.State = StatePlanPending
+			readiness.Reason = fmt.Sprintf("coverage plan with %d category(ies) must be acknowledged before rehearsal starts", len(c.plan.Categories))
 		case c.Rehearsal.InFlight > 0:
 			readiness.State = StateRehearsing
 			readiness.Reason = fmt.Sprintf("rehearsal in progress: %d request(s) still running", c.Rehearsal.InFlight)
@@ -369,6 +496,25 @@ func (c *Candidate) readinessLocked() Readiness {
 			readiness.Reason = fmt.Sprintf("rehearsal incomplete: %d/%d successful request(s)",
 				c.Rehearsal.Succeeded, c.Rehearsal.RequiredSuccesses)
 		default:
+			if c.plan != nil {
+				report := buildCandidateReport(c)
+				var reasons []string
+				allSatisfied := true
+				for _, category := range report.Categories {
+					if !category.Satisfied {
+						allSatisfied = false
+						for _, reason := range category.Reasons {
+							reasons = append(reasons, category.Plan.ID+": "+reason)
+						}
+					}
+				}
+				if !allSatisfied {
+					readiness.State = StateInsufficient
+					readiness.Reason = "coverage plan not satisfied"
+					readiness.Reasons = reasons
+					return readiness
+				}
+			}
 			readiness.State = StateReady
 			readiness.Ready = true
 		}
@@ -378,7 +524,7 @@ func (c *Candidate) readinessLocked() Readiness {
 	return readiness
 }
 
-func (s *Store) appendReleaseLocked(kind Kind, sourceID string, snapshot *config.Snapshot, summary *RehearsalSummary) Release {
+func (s *Store) appendReleaseLocked(kind Kind, sourceID string, snapshot *config.Snapshot, summary *RehearsalSummary, basis *CoverageBasis) Release {
 	s.seq++
 	release := Release{
 		ID:          fmt.Sprintf("rel-%d", s.seq),
@@ -393,6 +539,7 @@ func (s *Store) appendReleaseLocked(kind Kind, sourceID string, snapshot *config
 		copied := *summary
 		release.Rehearsal = &copied
 	}
+	release.Coverage = basis
 	s.history = append(s.history, release)
 	return release
 }
@@ -404,11 +551,13 @@ func (s *Store) appendReleaseLocked(kind Kind, sourceID string, snapshot *config
 // not invalidate routing rehearsal evidence.
 func Fingerprint(snapshot *config.Snapshot) string {
 	payload := struct {
-		Upstreams []config.Upstream `json:"upstreams"`
-		Routes    []config.Route    `json:"routes"`
+		Upstreams []config.Upstream    `json:"upstreams"`
+		Routes    []config.Route       `json:"routes"`
+		Coverage  *config.CoveragePlan `json:"coverage,omitempty"`
 	}{
 		Upstreams: snapshot.Upstreams(),
 		Routes:    snapshot.Routes(),
+		Coverage:  snapshot.CoveragePlan(),
 	}
 	data, _ := json.Marshal(payload)
 	sum := sha256.Sum256(data)

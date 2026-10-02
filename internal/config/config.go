@@ -27,6 +27,84 @@ type Config struct {
 // limited rehearsal traffic before it is allowed to become the release.
 type ReleasePolicy struct {
 	MinSuccessfulRehearsals int `json:"min_successful_rehearsals"`
+	// Coverage, when present, defines the per-business-category rehearsal
+	// coverage plan that must be acknowledged before rehearsal traffic is
+	// accepted and satisfied before a candidate may be released.
+	Coverage *CoveragePlan `json:"coverage,omitempty"`
+}
+
+// CoveragePlan groups rehearsal requests into user-defined business
+// categories. One request may belong to several categories at once.
+type CoveragePlan struct {
+	Categories []CoverageCategory `json:"categories"`
+}
+
+// CoverageCategory is one required request class. A request belongs to the
+// category when its method is allowed, its path matches at least one prefix,
+// and the optional header carries the required value. An empty
+// header_value matches on header presence only. Every criterion that is
+// left empty is ignored, so at least one criterion must be set.
+type CoverageCategory struct {
+	ID           string   `json:"id"`
+	Description  string   `json:"description,omitempty"`
+	Methods      []string `json:"methods,omitempty"`
+	PathPrefixes []string `json:"path_prefixes,omitempty"`
+	HeaderName   string   `json:"header_name,omitempty"`
+	HeaderValue  string   `json:"header_value,omitempty"`
+	// HighRisk categories are judged independently: the overall average can
+	// never compensate for missing or invalid high-risk evidence.
+	HighRisk bool `json:"high_risk"`
+	// MinValidSamples is the number of distinct valid (successful, matched)
+	// rehearsal requests the category must contain. Zero means the category
+	// is tracked and reported but not required by the release gate.
+	MinValidSamples int `json:"min_valid_samples"`
+}
+
+// Matches reports whether a request described by method/path/headers belongs
+// to this category. Empty criteria are wildcards.
+func (c CoverageCategory) Matches(method, path string, headers http.Header) bool {
+	if len(c.Methods) > 0 {
+		allowed := false
+		for _, candidate := range c.Methods {
+			if strings.EqualFold(candidate, method) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return false
+		}
+	}
+	if len(c.PathPrefixes) > 0 {
+		matched := false
+		for _, prefix := range c.PathPrefixes {
+			if hasPrefix(path, prefix) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	if c.HeaderName != "" {
+		value, present := headers[http.CanonicalHeaderKey(c.HeaderName)]
+		if !present {
+			return false
+		}
+		if c.HeaderValue != "" {
+			matchedValue := false
+			for _, candidate := range value {
+				if candidate == c.HeaderValue {
+					matchedValue = true
+				}
+			}
+			if !matchedValue {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 type Duration time.Duration
@@ -71,6 +149,7 @@ type Snapshot struct {
 	AdminPath               string
 	DrainTimeout            time.Duration
 	minSuccessfulRehearsals int
+	coverage                *CoveragePlan
 	upstreams               map[string]*Upstream
 	routes                  []matchedRoute
 }
@@ -101,6 +180,12 @@ func (s *Snapshot) MinSuccessfulRehearsals() int {
 		return 1
 	}
 	return s.minSuccessfulRehearsals
+}
+
+// CoveragePlan returns the configured per-category coverage plan, or nil when
+// no category requirements were defined.
+func (s *Snapshot) CoveragePlan() *CoveragePlan {
+	return s.coverage
 }
 
 // Routes returns the configured routes in declaration order.
@@ -166,6 +251,10 @@ func (c *Config) Snapshot() (*Snapshot, error) {
 	if c.Release.MinSuccessfulRehearsals < 0 {
 		return nil, errors.New("release.min_successful_rehearsals must not be negative")
 	}
+	coverage, err := validateCoverage(c.Release.Coverage)
+	if err != nil {
+		return nil, err
+	}
 	if !strings.HasPrefix(c.AdminPath, "/") {
 		return nil, errors.New("admin_path must start with /")
 	}
@@ -226,9 +315,48 @@ func (c *Config) Snapshot() (*Snapshot, error) {
 		AdminPath:               path.Clean(c.AdminPath),
 		DrainTimeout:            time.Duration(c.DrainTimeout),
 		minSuccessfulRehearsals: c.Release.MinSuccessfulRehearsals,
+		coverage:                coverage,
 		upstreams:               upstreams,
 		routes:                  routes,
 	}, nil
+}
+
+func validateCoverage(plan *CoveragePlan) (*CoveragePlan, error) {
+	if plan == nil || len(plan.Categories) == 0 {
+		return nil, nil
+	}
+	seen := make(map[string]struct{}, len(plan.Categories))
+	for i := range plan.Categories {
+		category := plan.Categories[i]
+		if category.ID == "" {
+			return nil, errors.New("release.coverage category id is required")
+		}
+		if _, exists := seen[category.ID]; exists {
+			return nil, fmt.Errorf("release.coverage duplicate category id %q", category.ID)
+		}
+		seen[category.ID] = struct{}{}
+		if category.MinValidSamples < 0 {
+			return nil, fmt.Errorf("release.coverage category %q min_valid_samples must not be negative", category.ID)
+		}
+		if len(category.Methods) == 0 && len(category.PathPrefixes) == 0 && category.HeaderName == "" {
+			return nil, fmt.Errorf("release.coverage category %q must define methods, path_prefixes or header_name", category.ID)
+		}
+		for _, method := range category.Methods {
+			if method == "" {
+				return nil, fmt.Errorf("release.coverage category %q has an empty method", category.ID)
+			}
+		}
+		for _, prefix := range category.PathPrefixes {
+			if !strings.HasPrefix(prefix, "/") {
+				return nil, fmt.Errorf("release.coverage category %q prefix %q must start with /", category.ID, prefix)
+			}
+		}
+		if category.HeaderName == "" && category.HeaderValue != "" {
+			return nil, fmt.Errorf("release.coverage category %q sets header_value without header_name", category.ID)
+		}
+		plan.Categories[i] = category
+	}
+	return plan, nil
 }
 
 type Store struct {

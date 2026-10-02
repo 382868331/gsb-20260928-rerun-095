@@ -66,6 +66,18 @@ func (a *Admin) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	case request.Method == http.MethodGet && strings.HasPrefix(relative, "/candidates/") && strings.HasSuffix(relative, "/diff"):
 		id := strings.TrimSuffix(strings.TrimPrefix(relative, "/candidates/"), "/diff")
 		a.handleDiff(writer, request, id)
+	case request.Method == http.MethodGet && strings.HasPrefix(relative, "/candidates/") && strings.HasSuffix(relative, "/coverage"):
+		id := strings.TrimSuffix(strings.TrimPrefix(relative, "/candidates/"), "/coverage")
+		a.handleCoverage(writer, id)
+	case request.Method == http.MethodPost && strings.HasPrefix(relative, "/candidates/") && strings.HasSuffix(relative, "/coverage/acknowledge"):
+		id := strings.TrimSuffix(strings.TrimPrefix(relative, "/candidates/"), "/coverage/acknowledge")
+		a.handleAcknowledge(writer, request, id)
+	case request.Method == http.MethodPost && strings.HasPrefix(relative, "/candidates/") && strings.HasSuffix(relative, "/supplements"):
+		id := strings.TrimSuffix(strings.TrimPrefix(relative, "/candidates/"), "/supplements")
+		a.handleStartSupplement(writer, request, id)
+	case request.Method == http.MethodPost && strings.HasPrefix(relative, "/supplements/") && strings.HasSuffix(relative, "/end"):
+		id := strings.TrimSuffix(strings.TrimPrefix(relative, "/supplements/"), "/end")
+		a.handleEndSupplement(writer, id)
 	case request.Method == http.MethodPost && relative == "/candidates":
 		a.handleStage(writer)
 	case request.Method == http.MethodPost && strings.HasPrefix(relative, "/candidates/") && strings.HasSuffix(relative, "/confirm"):
@@ -79,6 +91,53 @@ func (a *Admin) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	default:
 		a.writeJSON(writer, http.StatusNotFound, map[string]string{"error": "unknown admin endpoint"})
 	}
+}
+
+func (a *Admin) handleCoverage(writer http.ResponseWriter, candidateID string) {
+	report, candidate, err := a.releases.CoverageReport(candidateID)
+	if err != nil {
+		a.writeCandidateError(writer, err)
+		return
+	}
+	a.writeJSON(writer, http.StatusOK, map[string]any{"candidate": candidate, "report": report})
+}
+
+func (a *Admin) handleAcknowledge(writer http.ResponseWriter, request *http.Request, candidateID string) {
+	source := request.URL.Query().Get("source")
+	candidate, err := a.releases.AcknowledgePlan(candidateID, source)
+	if err != nil {
+		a.writeCandidateError(writer, err)
+		return
+	}
+	a.writeJSON(writer, http.StatusOK, candidate)
+}
+
+func (a *Admin) handleStartSupplement(writer http.ResponseWriter, request *http.Request, candidateID string) {
+	var body struct {
+		Source     string   `json:"source"`
+		Categories []string `json:"category_ids"`
+	}
+	if request.Body != nil {
+		_ = json.NewDecoder(request.Body).Decode(&body)
+	}
+	if len(body.Categories) == 0 {
+		body.Categories = request.URL.Query()["category"]
+	}
+	batch, err := a.releases.StartSupplement(candidateID, body.Source, body.Categories)
+	if err != nil {
+		a.writeCandidateError(writer, err)
+		return
+	}
+	a.writeJSON(writer, http.StatusCreated, batch)
+}
+
+func (a *Admin) handleEndSupplement(writer http.ResponseWriter, batchID string) {
+	batch, err := a.releases.EndSupplement(batchID)
+	if err != nil {
+		a.writeCandidateError(writer, err)
+		return
+	}
+	a.writeJSON(writer, http.StatusOK, batch)
 }
 
 // handleStage validates the on-disk configuration and registers it as a

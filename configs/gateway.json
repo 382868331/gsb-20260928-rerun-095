@@ -3,7 +3,35 @@
   "admin_path": "/__gateway",
   "drain_timeout": "30s",
   "release": {
-    "min_successful_rehearsals": 1
+    "min_successful_rehearsals": 1,
+    "coverage": {
+      "categories": [
+        {
+          "id": "healthchecks",
+          "description": "健康检查类请求",
+          "methods": ["GET", "HEAD"],
+          "path_prefixes": ["/v1/health", "/v2/health"],
+          "min_valid_samples": 1
+        },
+        {
+          "id": "echo-reads",
+          "description": "echo 读流量",
+          "methods": ["GET"],
+          "path_prefixes": ["/v1/echo/", "/v2/echo/"],
+          "min_valid_samples": 2
+        },
+        {
+          "id": "pay-traffic",
+          "description": "支付高风险类别：总体平均值不能掩盖该类别缺口或失败",
+          "methods": ["POST"],
+          "path_prefixes": ["/v1/echo/", "/v2/echo/"],
+          "header_name": "X-Biz",
+          "header_value": "pay",
+          "high_risk": true,
+          "min_valid_samples": 1
+        }
+      ]
+    }
   },
   "upstreams": [
     {
