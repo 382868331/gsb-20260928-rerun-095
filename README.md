@@ -67,6 +67,27 @@ curl -X POST 'http://127.0.0.1:8080/__gateway/rollback?release=rel-1'
 - `GET /__gateway/releases` 返回完整发布历史（initial / promote / rollback）及当前现役发布；promote 记录携带当时的演练证据（成功/失败/取消/中止计数）。
 - 确认未达标候选返回 `409` 并说明原因，未知候选返回 `404`。
 
+## 按业务类别的覆盖计划
+
+发布演练可以声明必须覆盖的请求类别，配置在 `release.coverage_categories`：
+
+```json
+"release": {
+  "min_successful_rehearsals": 1,
+  "coverage_categories": [
+    {"id": "reads", "methods": ["GET"], "prefixes": ["/v1/"], "min_samples": 2},
+    {"id": "payments", "methods": ["POST"], "prefixes": ["/v1/pay"], "min_samples": 1, "high_risk": true}
+  ]
+}
+```
+
+- 类别按方法（空为任意）和路径前缀（空为任意）匹配；同一请求可属于多个类别，各类别分别统计，整体计数按请求去重，不会重复累计。
+- 声明了类别计划的候选在演练开始前必须先确认要求：`POST /__gateway/candidates/<id>/coverage/confirm`。确认前带 `X-Gateway-Release` 头的请求仍走现役发布，不会产生证据。
+- 只有成功结束的请求计入有效覆盖；失败、取消、中止和未命中路由的无效请求会被记录但永远不算有效样本。高风险类别（`high_risk`）必须自身达标（样本数足够且零失败/取消/中止），不能被总体平均值掩盖。
+- `GET /__gateway/candidates/<id>/report` 输出演练报告：整体去重统计、每个类别的基线与候选路由差异、有效/缺失样本数和不满足条件的具体原因、按来源分组的补充批次，以及完整证据列表。
+- 补充尚未覆盖的类别时，给演练请求加 `X-Gateway-Rehearsal-Source: <批次名>` 头；报告按来源保留每次补充的来源与结果。中途停止后继续演练时证据保留在同一候选上，按请求 ID 去重，最终发布判断使用同一组可追溯证据，无法靠重复样本或挑选有利结果通过。
+- 调整类别规则或覆盖要求会改变候选指纹：在途候选立即 `superseded`，旧证据不再可作为发布依据；旧报告仍可查看，并明确标注失效原因（被哪个修订取代或已放弃）。发布记录中保存当时的各类别覆盖结果。
+
 ## 优雅关停
 
 服务收到 `SIGTERM` 后停止接受新请求（新请求得到 `503 gateway draining`），在途请求在 `drain_timeout` 内按约定收尾；超出等待范围的请求被取消并记录 `aborted=true`、`error="shutdown deadline exceeded"` 的明确终态。

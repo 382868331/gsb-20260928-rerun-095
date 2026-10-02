@@ -44,6 +44,76 @@ func newTestAdmin(t *testing.T, next *config.Snapshot) (*Admin, *release.Store) 
 	return handler, stores
 }
 
+func TestCoveragePlanConfirmAndReportEndpoints(t *testing.T) {
+	withPlan := func(routeID, host string) *config.Snapshot {
+		cfg := &config.Config{
+			Listen:    "127.0.0.1:0",
+			AdminPath: "/__gateway",
+			Release: config.ReleasePolicy{
+				MinSuccessfulRehearsals: 1,
+				CoverageCategories: []config.CoverageCategory{
+					{ID: "reads", Methods: []string{"GET"}, Prefixes: []string{"/" + routeID + "/"}, MinSamples: 1},
+				},
+			},
+			Upstreams: []config.Upstream{{ID: "up-" + routeID, BaseURL: "http://" + host, Timeout: config.Duration(time.Second)}},
+			Routes: []config.Route{{
+				ID: routeID, Version: routeID, Prefix: "/" + routeID + "/", UpstreamID: "up-" + routeID,
+			}},
+		}
+		snapshot, err := cfg.Snapshot()
+		if err != nil {
+			panic(err)
+		}
+		return snapshot
+	}
+	stores := release.NewStore(withPlan("v1", "old.example"))
+	handler := New(stores, state.NewStore(), record.NewStore(10),
+		func() (release.Candidate, error) { return stores.Stage(withPlan("v2", "new.example")), nil },
+		stores.Confirm,
+		stores.Rollback,
+	)
+	candidate := stores.Stage(withPlan("v2", "new.example"))
+
+	// Plan must be confirmed before rehearsal evidence can accumulate.
+	confirmPlan := httptest.NewRequest(http.MethodPost, "/__gateway/candidates/"+candidate.ID+"/coverage/confirm", nil)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, confirmPlan)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("coverage confirm status = %d body = %s", recorder.Code, recorder.Body.String())
+	}
+
+	rehearsal := httptest.NewRequest(http.MethodGet, "/v2/echo", nil)
+	rehearsal.Header.Set(release.RehearsalHeader, candidate.ID)
+	selection := stores.Select(rehearsal)
+	stores.FinishRehearsal(selection.CandidateID, release.RehearsalOutcome{
+		RequestID: "r1", Method: "GET", Path: "/v2/echo", Status: 200,
+	})
+
+	reportReq := httptest.NewRequest(http.MethodGet, "/__gateway/candidates/"+candidate.ID+"/report", nil)
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, reportReq)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("report status = %d body = %s", recorder.Code, recorder.Body.String())
+	}
+	var report release.CandidateReport
+	if err := json.Unmarshal(recorder.Body.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if !report.PlanConfirmed || !report.EvidenceValid || len(report.Categories) != 1 {
+		t.Fatalf("report = %+v", report)
+	}
+	if !report.Categories[0].Satisfied || report.Categories[0].Valid != 1 {
+		t.Fatalf("category report = %+v", report.Categories[0])
+	}
+
+	unknown := httptest.NewRequest(http.MethodGet, "/__gateway/candidates/cand-99/report", nil)
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, unknown)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("unknown report status = %d", recorder.Code)
+	}
+}
+
 func TestConfirmFreshCandidateReturnsConflict(t *testing.T) {
 	handler, stores := newTestAdmin(t, snapshotForAdmin("v2", "new.example"))
 	candidate := stores.Stage(snapshotForAdmin("v2", "new.example"))

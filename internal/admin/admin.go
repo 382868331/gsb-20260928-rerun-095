@@ -66,8 +66,14 @@ func (a *Admin) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	case request.Method == http.MethodGet && strings.HasPrefix(relative, "/candidates/") && strings.HasSuffix(relative, "/diff"):
 		id := strings.TrimSuffix(strings.TrimPrefix(relative, "/candidates/"), "/diff")
 		a.handleDiff(writer, request, id)
+	case request.Method == http.MethodGet && strings.HasPrefix(relative, "/candidates/") && strings.HasSuffix(relative, "/report"):
+		id := strings.TrimSuffix(strings.TrimPrefix(relative, "/candidates/"), "/report")
+		a.handleReport(writer, id)
 	case request.Method == http.MethodPost && relative == "/candidates":
 		a.handleStage(writer)
+	case request.Method == http.MethodPost && strings.HasPrefix(relative, "/candidates/") && strings.HasSuffix(relative, "/coverage/confirm"):
+		id := strings.TrimSuffix(strings.TrimPrefix(relative, "/candidates/"), "/coverage/confirm")
+		a.handleConfirmPlan(writer, id)
 	case request.Method == http.MethodPost && strings.HasPrefix(relative, "/candidates/") && strings.HasSuffix(relative, "/confirm"):
 		id := strings.TrimSuffix(strings.TrimPrefix(relative, "/candidates/"), "/confirm")
 		a.handleConfirm(writer, id)
@@ -128,6 +134,31 @@ func (a *Admin) handleDiff(writer http.ResponseWriter, request *http.Request, ca
 		return
 	}
 	a.writeJSON(writer, http.StatusOK, diff)
+}
+
+// handleReport returns the full rehearsal report of one candidate: overall
+// deduplicated counts, per-category coverage with baseline-vs-candidate
+// diffs and unmet reasons, supplement batches and the raw evidence trail.
+// Reports of superseded or discarded candidates stay available and explain
+// why their evidence stopped being a valid release basis.
+func (a *Admin) handleReport(writer http.ResponseWriter, candidateID string) {
+	report, err := a.releases.Report(candidateID)
+	if err != nil {
+		a.writeCandidateError(writer, err)
+		return
+	}
+	a.writeJSON(writer, http.StatusOK, report)
+}
+
+// handleConfirmPlan acknowledges the candidate's coverage plan before
+// rehearsal traffic starts; only then do pinned requests gather evidence.
+func (a *Admin) handleConfirmPlan(writer http.ResponseWriter, candidateID string) {
+	candidate, err := a.releases.ConfirmPlan(candidateID)
+	if err != nil {
+		a.writeCandidateError(writer, err)
+		return
+	}
+	a.writeJSON(writer, http.StatusOK, candidate)
 }
 
 func (a *Admin) handleDiscard(writer http.ResponseWriter, candidateID string) {

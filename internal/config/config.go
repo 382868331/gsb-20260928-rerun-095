@@ -26,7 +26,49 @@ type Config struct {
 // ReleasePolicy controls the evidence a candidate must gather through
 // limited rehearsal traffic before it is allowed to become the release.
 type ReleasePolicy struct {
-	MinSuccessfulRehearsals int `json:"min_successful_rehearsals"`
+	MinSuccessfulRehearsals int                `json:"min_successful_rehearsals"`
+	CoverageCategories      []CoverageCategory `json:"coverage_categories"`
+}
+
+// CoverageCategory defines one business category of requests that a
+// candidate must cover with valid rehearsal samples before release. A
+// request belongs to a category when its method matches Methods (empty means
+// any method) and its path is under one of Prefixes (empty means any path).
+// One request may belong to several categories at once.
+type CoverageCategory struct {
+	ID         string   `json:"id"`
+	Methods    []string `json:"methods"`
+	Prefixes   []string `json:"prefixes"`
+	MinSamples int      `json:"min_samples"`
+	// HighRisk categories must individually pass (minimum samples met and
+	// no failed, canceled or aborted samples); their result can never be
+	// masked by a healthy overall average.
+	HighRisk bool `json:"high_risk"`
+}
+
+// Matches reports whether one request belongs to the category.
+func (c CoverageCategory) Matches(method, requestPath string) bool {
+	if len(c.Methods) > 0 {
+		found := false
+		for _, allowed := range c.Methods {
+			if strings.EqualFold(allowed, method) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	if len(c.Prefixes) == 0 {
+		return true
+	}
+	for _, prefix := range c.Prefixes {
+		if requestPath == prefix || strings.HasPrefix(requestPath, strings.TrimSuffix(prefix, "/")+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 type Duration time.Duration
@@ -71,6 +113,7 @@ type Snapshot struct {
 	AdminPath               string
 	DrainTimeout            time.Duration
 	minSuccessfulRehearsals int
+	coverageCategories      []CoverageCategory
 	upstreams               map[string]*Upstream
 	routes                  []matchedRoute
 }
@@ -101,6 +144,14 @@ func (s *Snapshot) MinSuccessfulRehearsals() int {
 		return 1
 	}
 	return s.minSuccessfulRehearsals
+}
+
+// CoverageCategories returns the rehearsal coverage plan in declaration
+// order. An empty plan means no per-category gating applies.
+func (s *Snapshot) CoverageCategories() []CoverageCategory {
+	result := make([]CoverageCategory, len(s.coverageCategories))
+	copy(result, s.coverageCategories)
+	return result
 }
 
 // Routes returns the configured routes in declaration order.
@@ -166,6 +217,24 @@ func (c *Config) Snapshot() (*Snapshot, error) {
 	if c.Release.MinSuccessfulRehearsals < 0 {
 		return nil, errors.New("release.min_successful_rehearsals must not be negative")
 	}
+	seenCategories := make(map[string]struct{}, len(c.Release.CoverageCategories))
+	for _, category := range c.Release.CoverageCategories {
+		if category.ID == "" {
+			return nil, errors.New("release coverage category id is required")
+		}
+		if _, exists := seenCategories[category.ID]; exists {
+			return nil, fmt.Errorf("duplicate release coverage category %q", category.ID)
+		}
+		seenCategories[category.ID] = struct{}{}
+		if category.MinSamples <= 0 {
+			return nil, fmt.Errorf("release coverage category %q min_samples must be positive", category.ID)
+		}
+		for _, prefix := range category.Prefixes {
+			if !strings.HasPrefix(prefix, "/") {
+				return nil, fmt.Errorf("release coverage category %q prefix %q must start with /", category.ID, prefix)
+			}
+		}
+	}
 	if !strings.HasPrefix(c.AdminPath, "/") {
 		return nil, errors.New("admin_path must start with /")
 	}
@@ -226,6 +295,7 @@ func (c *Config) Snapshot() (*Snapshot, error) {
 		AdminPath:               path.Clean(c.AdminPath),
 		DrainTimeout:            time.Duration(c.DrainTimeout),
 		minSuccessfulRehearsals: c.Release.MinSuccessfulRehearsals,
+		coverageCategories:      append([]CoverageCategory(nil), c.Release.CoverageCategories...),
 		upstreams:               upstreams,
 		routes:                  routes,
 	}, nil

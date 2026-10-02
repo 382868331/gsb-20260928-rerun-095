@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,6 +18,11 @@ import (
 // RehearsalHeader selects a staged candidate for a single request, which is
 // how limited rehearsal traffic is directed before a release is confirmed.
 const RehearsalHeader = "X-Gateway-Release"
+
+// RehearsalSourceHeader labels which rehearsal batch a pinned request
+// belongs to. Supplementary runs that top up missing coverage categories
+// use a distinct source so the report keeps each batch's origin and result.
+const RehearsalSourceHeader = "X-Gateway-Rehearsal-Source"
 
 type Kind string
 
@@ -57,6 +63,9 @@ var (
 )
 
 // RehearsalSummary is the accumulated evidence gathered by rehearsal traffic.
+// Counts are deduplicated by request: one rehearsal request contributes at
+// most one terminal outcome here even when it matches several coverage
+// categories.
 type RehearsalSummary struct {
 	RequiredSuccesses int64 `json:"required_successes"`
 	InFlight          int64 `json:"in_flight"`
@@ -64,6 +73,34 @@ type RehearsalSummary struct {
 	Failed            int64 `json:"failed"`
 	Canceled          int64 `json:"canceled"`
 	Aborted           int64 `json:"aborted"`
+	Invalid           int64 `json:"invalid"`
+}
+
+// CategoryStats accumulates per-category rehearsal outcomes. Only
+// successful terminal outcomes count as valid coverage; failed, canceled,
+// aborted and invalid (unrouted) requests never do.
+type CategoryStats struct {
+	Required int64 `json:"required"`
+	Valid    int64 `json:"valid"`
+	Failed   int64 `json:"failed"`
+	Canceled int64 `json:"canceled"`
+	Aborted  int64 `json:"aborted"`
+	Invalid  int64 `json:"invalid"`
+}
+
+// EvidenceEntry is one rehearsal request's terminal outcome, kept so the
+// final release decision can be traced back to concrete samples instead of
+// bare counters. Source identifies which rehearsal batch (initial run or a
+// named supplement) produced the sample.
+type EvidenceEntry struct {
+	RequestID  string    `json:"request_id"`
+	Source     string    `json:"source"`
+	Method     string    `json:"method"`
+	Path       string    `json:"path"`
+	Categories []string  `json:"categories"`
+	Outcome    string    `json:"outcome"`
+	Counted    bool      `json:"counted"`
+	At         time.Time `json:"at"`
 }
 
 // Readiness explains whether a candidate is releasable and why.
@@ -84,6 +121,7 @@ type Release struct {
 	Routes      []string          `json:"routes"`
 	Fingerprint string            `json:"fingerprint"`
 	Rehearsal   *RehearsalSummary `json:"rehearsal,omitempty"`
+	Coverage    []CategoryReport  `json:"coverage,omitempty"`
 
 	snapshot *config.Snapshot
 }
@@ -92,24 +130,36 @@ type Release struct {
 // until it is confirmed, discarded, superseded or promoted. Candidates are
 // never deleted so the full rehearsal and release trail stays auditable.
 type Candidate struct {
-	ID          string           `json:"id"`
-	CreatedAt   time.Time        `json:"created_at"`
-	ResolvedAt  time.Time        `json:"resolved_at,omitempty"`
-	State       CandidateState   `json:"state"`
-	Routes      []string         `json:"routes"`
-	Fingerprint string           `json:"fingerprint"`
-	Rehearsal   RehearsalSummary `json:"rehearsal"`
-	Readiness   Readiness        `json:"readiness"`
+	ID            string                    `json:"id"`
+	CreatedAt     time.Time                 `json:"created_at"`
+	ResolvedAt    time.Time                 `json:"resolved_at,omitempty"`
+	State         CandidateState            `json:"state"`
+	Routes        []string                  `json:"routes"`
+	Fingerprint   string                    `json:"fingerprint"`
+	CoveragePlan  []config.CoverageCategory `json:"coverage_plan"`
+	PlanConfirmed bool                      `json:"plan_confirmed"`
+	Rehearsal     RehearsalSummary          `json:"rehearsal"`
+	Coverage      map[string]*CategoryStats `json:"coverage"`
+	Evidence      []EvidenceEntry           `json:"evidence"`
+	Readiness     Readiness                 `json:"readiness"`
+	// InvalidatedBy names the newer revision that voided this candidate's
+	// evidence, so old reports explain why their release basis expired.
+	InvalidatedBy string `json:"invalidated_by,omitempty"`
 
 	snapshot *config.Snapshot
+	seen     map[string]struct{}
 }
 
 // RehearsalOutcome reports how one pinned rehearsal request ended.
 type RehearsalOutcome struct {
-	Status   int
-	Error    string
-	Canceled bool
-	Aborted  bool
+	RequestID string
+	Source    string
+	Method    string
+	Path      string
+	Status    int
+	Error     string
+	Canceled  bool
+	Aborted   bool
 }
 
 type Store struct {
@@ -157,7 +207,7 @@ func (s *Store) Select(request *http.Request) Selection {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if id := request.Header.Get(RehearsalHeader); id != "" {
-		if candidate, ok := s.candidates[id]; ok && candidate.State == StateStaged {
+		if candidate, ok := s.candidates[id]; ok && candidate.State == StateStaged && candidate.PlanConfirmed {
 			candidate.Rehearsal.InFlight++
 			return Selection{Snapshot: candidate.snapshot, ID: candidate.ID, CandidateID: candidate.ID}
 		}
@@ -168,7 +218,9 @@ func (s *Store) Select(request *http.Request) Selection {
 // FinishRehearsal records the terminal outcome of one pinned rehearsal
 // request. Evidence is attributed to the candidate revision the request was
 // bound to even if the candidate was superseded or discarded while the
-// request was in flight.
+// request was in flight. Each request is counted once: a repeated
+// RequestID is logged as evidence but never double-counted, so resumed or
+// supplemented rehearsals cannot inflate coverage with duplicate samples.
 func (s *Store) FinishRehearsal(candidateID string, outcome RehearsalOutcome) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -179,16 +231,93 @@ func (s *Store) FinishRehearsal(candidateID string, outcome RehearsalOutcome) {
 	if candidate.Rehearsal.InFlight > 0 {
 		candidate.Rehearsal.InFlight--
 	}
+	kind := classifyOutcome(outcome)
+	counted := true
+	if outcome.RequestID != "" {
+		if _, seen := candidate.seen[outcome.RequestID]; seen {
+			counted = false
+		} else {
+			candidate.seen[outcome.RequestID] = struct{}{}
+		}
+	}
+	source := outcome.Source
+	if source == "" {
+		source = "rehearsal"
+	}
+	categories := matchedCategories(candidate.snapshot, outcome.Method, outcome.Path)
+	if counted {
+		switch kind {
+		case "succeeded":
+			candidate.Rehearsal.Succeeded++
+		case "failed":
+			candidate.Rehearsal.Failed++
+		case "canceled":
+			candidate.Rehearsal.Canceled++
+		case "aborted":
+			candidate.Rehearsal.Aborted++
+		case "invalid":
+			candidate.Rehearsal.Invalid++
+		}
+		for _, id := range categories {
+			stats := candidate.Coverage[id]
+			if stats == nil {
+				continue
+			}
+			switch kind {
+			case "succeeded":
+				stats.Valid++
+			case "failed":
+				stats.Failed++
+			case "canceled":
+				stats.Canceled++
+			case "aborted":
+				stats.Aborted++
+			case "invalid":
+				stats.Invalid++
+			}
+		}
+	}
+	if candidate.Evidence == nil {
+		candidate.Evidence = []EvidenceEntry{}
+	}
+	candidate.Evidence = append(candidate.Evidence, EvidenceEntry{
+		RequestID:  outcome.RequestID,
+		Source:     source,
+		Method:     outcome.Method,
+		Path:       outcome.Path,
+		Categories: categories,
+		Outcome:    kind,
+		Counted:    counted,
+		At:         time.Now(),
+	})
+}
+
+// classifyOutcome maps a terminal request state to its evidence bucket.
+// Failed, canceled, aborted and invalid (unrouted) requests are recorded but
+// never count as valid coverage.
+func classifyOutcome(outcome RehearsalOutcome) string {
 	switch {
 	case outcome.Aborted:
-		candidate.Rehearsal.Aborted++
+		return "aborted"
 	case outcome.Canceled:
-		candidate.Rehearsal.Canceled++
+		return "canceled"
+	case outcome.Error == "no route matched":
+		return "invalid"
 	case outcome.Error != "" || outcome.Status == 0 || outcome.Status >= http.StatusInternalServerError:
-		candidate.Rehearsal.Failed++
+		return "failed"
 	default:
-		candidate.Rehearsal.Succeeded++
+		return "succeeded"
 	}
+}
+
+func matchedCategories(snapshot *config.Snapshot, method, path string) []string {
+	matched := []string{}
+	for _, category := range snapshot.CoverageCategories() {
+		if category.Matches(method, path) {
+			matched = append(matched, category.ID)
+		}
+	}
+	return matched
 }
 
 // Stage registers an already validated snapshot as a candidate. It never
@@ -214,19 +343,54 @@ func (s *Store) Stage(snapshot *config.Snapshot) Candidate {
 		existing.ResolvedAt = time.Now()
 	}
 	s.candSeq++
+	plan := snapshot.CoverageCategories()
+	coverage := make(map[string]*CategoryStats, len(plan))
+	for _, category := range plan {
+		coverage[category.ID] = &CategoryStats{Required: int64(category.MinSamples)}
+	}
 	candidate := &Candidate{
-		ID:          fmt.Sprintf("cand-%d", s.candSeq),
-		CreatedAt:   time.Now(),
-		State:       StateStaged,
-		Routes:      snapshot.DescribeRoutes(),
-		Fingerprint: fingerprint,
+		ID:            fmt.Sprintf("cand-%d", s.candSeq),
+		CreatedAt:     time.Now(),
+		State:         StateStaged,
+		Routes:        snapshot.DescribeRoutes(),
+		Fingerprint:   fingerprint,
+		CoveragePlan:  plan,
+		PlanConfirmed: len(plan) == 0,
+		Coverage:      coverage,
+		Evidence:      []EvidenceEntry{},
 		Rehearsal: RehearsalSummary{
 			RequiredSuccesses: int64(snapshot.MinSuccessfulRehearsals()),
 		},
 		snapshot: snapshot,
+		seen:     make(map[string]struct{}),
 	}
 	s.candidates[candidate.ID] = candidate
+	for _, existing := range s.candidates {
+		if existing.State == StateSuperseded && existing.InvalidatedBy == "" && existing.ID != candidate.ID {
+			existing.InvalidatedBy = candidate.ID
+		}
+	}
 	return *candidate
+}
+
+// ConfirmPlan acknowledges the coverage plan of a staged candidate before
+// rehearsal traffic starts. Requests pinned to a candidate whose plan is not
+// confirmed yet are served by the active release instead, so no evidence can
+// accumulate before the operator has reviewed the requirements.
+func (s *Store) ConfirmPlan(candidateID string) (Candidate, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	candidate, ok := s.candidates[candidateID]
+	if !ok {
+		return Candidate{}, fmt.Errorf("%w %q", ErrUnknownCandidate, candidateID)
+	}
+	if candidate.State != StateStaged {
+		return Candidate{}, fmt.Errorf("%w: %s", ErrNotStaged, candidate.State)
+	}
+	candidate.PlanConfirmed = true
+	copied := *candidate
+	copied.Readiness = candidate.readinessLocked()
+	return copied, nil
 }
 
 // Confirm promotes a candidate to the active release and records the switch
@@ -247,6 +411,8 @@ func (s *Store) Confirm(candidateID string) (Release, error) {
 	candidate.State = StateConfirmed
 	candidate.ResolvedAt = time.Now()
 	release := s.appendReleaseLocked(KindPromote, candidate.ID, candidate.snapshot, &summary)
+	release.Coverage = candidate.categoryReportsLocked(s.active, s.activeID)
+	s.history[len(s.history)-1] = release
 	s.active = candidate.snapshot
 	s.activeID = release.ID
 	return release, nil
@@ -356,6 +522,8 @@ func (c *Candidate) readinessLocked() Readiness {
 	switch c.State {
 	case StateStaged:
 		switch {
+		case !c.PlanConfirmed:
+			readiness.Reason = "coverage plan not confirmed yet: review coverage_plan and confirm it before rehearsal"
 		case c.Rehearsal.InFlight > 0:
 			readiness.State = StateRehearsing
 			readiness.Reason = fmt.Sprintf("rehearsal in progress: %d request(s) still running", c.Rehearsal.InFlight)
@@ -372,10 +540,45 @@ func (c *Candidate) readinessLocked() Readiness {
 			readiness.State = StateReady
 			readiness.Ready = true
 		}
+		if readiness.Ready {
+			if reason := c.coverageShortfallLocked(); reason != "" {
+				readiness.State = StateInsufficient
+				readiness.Ready = false
+				readiness.Reason = reason
+			}
+		}
 	default:
 		readiness.Reason = "candidate is " + string(c.State)
+		if c.State == StateSuperseded && c.InvalidatedBy != "" {
+			readiness.Reason = fmt.Sprintf("candidate superseded by %s: rehearsal evidence is no longer a valid release basis", c.InvalidatedBy)
+		}
 	}
 	return readiness
+}
+
+// coverageShortfallLocked explains which coverage categories miss their
+// requirements, or returns "" when every category is satisfied. High-risk
+// categories must pass on their own evidence: their failures can never be
+// averaged away by the overall success count.
+func (c *Candidate) coverageShortfallLocked() string {
+	reasons := []string{}
+	for _, category := range c.CoveragePlan {
+		stats := c.Coverage[category.ID]
+		if stats == nil {
+			stats = &CategoryStats{Required: int64(category.MinSamples)}
+		}
+		if stats.Valid < stats.Required {
+			reasons = append(reasons, fmt.Sprintf("category %q has %d/%d valid sample(s) (%d missing)",
+				category.ID, stats.Valid, stats.Required, stats.Required-stats.Valid))
+		}
+		if category.HighRisk {
+			bad := stats.Failed + stats.Canceled + stats.Aborted
+			if bad > 0 {
+				reasons = append(reasons, fmt.Sprintf("high-risk category %q has %d failed/canceled/aborted sample(s)", category.ID, bad))
+			}
+		}
+	}
+	return strings.Join(reasons, "; ")
 }
 
 func (s *Store) appendReleaseLocked(kind Kind, sourceID string, snapshot *config.Snapshot, summary *RehearsalSummary) Release {
@@ -399,16 +602,19 @@ func (s *Store) appendReleaseLocked(kind Kind, sourceID string, snapshot *config
 
 // Fingerprint hashes the routing and limiting content of a snapshot:
 
-// upstream targets/timeouts and route prefixes, versions and retry limits.
-// Listener, admin and drain settings are excluded because changing them does
-// not invalidate routing rehearsal evidence.
+// upstream targets/timeouts, route prefixes, versions and retry limits, and
+// the rehearsal coverage plan. Listener, admin and drain settings are
+// excluded because changing them does not invalidate routing rehearsal
+// evidence; changing category rules or coverage requirements does.
 func Fingerprint(snapshot *config.Snapshot) string {
 	payload := struct {
-		Upstreams []config.Upstream `json:"upstreams"`
-		Routes    []config.Route    `json:"routes"`
+		Upstreams []config.Upstream         `json:"upstreams"`
+		Routes    []config.Route            `json:"routes"`
+		Coverage  []config.CoverageCategory `json:"coverage"`
 	}{
 		Upstreams: snapshot.Upstreams(),
 		Routes:    snapshot.Routes(),
+		Coverage:  snapshot.CoverageCategories(),
 	}
 	data, _ := json.Marshal(payload)
 	sum := sha256.Sum256(data)
