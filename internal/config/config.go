@@ -28,7 +28,19 @@ type Config struct {
 type ReleasePolicy struct {
 	MinSuccessfulRehearsals int                `json:"min_successful_rehearsals"`
 	CoverageCategories      []CoverageCategory `json:"coverage_categories"`
+	// PairAdoption decides how repeated executions of the same business
+	// request (retries after an interruption) are adopted as the pair
+	// evidence of one side: "first" keeps the first terminal execution,
+	// "latest" (default) adopts the most recent one. It is fixed before
+	// rehearsal starts; changing it forms a new review version.
+	PairAdoption string `json:"pair_adoption"`
 }
+
+// Pair adoption rules accepted by release.pair_adoption.
+const (
+	PairAdoptFirst  = "first"
+	PairAdoptLatest = "latest"
+)
 
 // CoverageCategory defines one business category of requests that a
 // candidate must cover with valid rehearsal samples before release. A
@@ -113,6 +125,7 @@ type Snapshot struct {
 	AdminPath               string
 	DrainTimeout            time.Duration
 	minSuccessfulRehearsals int
+	pairAdoption            string
 	coverageCategories      []CoverageCategory
 	upstreams               map[string]*Upstream
 	routes                  []matchedRoute
@@ -144,6 +157,15 @@ func (s *Snapshot) MinSuccessfulRehearsals() int {
 		return 1
 	}
 	return s.minSuccessfulRehearsals
+}
+
+// PairAdoption is the fixed rule deciding which repeated execution of one
+// business request is adopted as pair evidence for a side.
+func (s *Snapshot) PairAdoption() string {
+	if s.pairAdoption == "" {
+		return PairAdoptLatest
+	}
+	return s.pairAdoption
 }
 
 // CoverageCategories returns the rehearsal coverage plan in declaration
@@ -216,6 +238,11 @@ func (c *Config) Snapshot() (*Snapshot, error) {
 	}
 	if c.Release.MinSuccessfulRehearsals < 0 {
 		return nil, errors.New("release.min_successful_rehearsals must not be negative")
+	}
+	switch c.Release.PairAdoption {
+	case "", PairAdoptFirst, PairAdoptLatest:
+	default:
+		return nil, fmt.Errorf("release.pair_adoption must be %q or %q", PairAdoptFirst, PairAdoptLatest)
 	}
 	seenCategories := make(map[string]struct{}, len(c.Release.CoverageCategories))
 	for _, category := range c.Release.CoverageCategories {
@@ -295,6 +322,7 @@ func (c *Config) Snapshot() (*Snapshot, error) {
 		AdminPath:               path.Clean(c.AdminPath),
 		DrainTimeout:            time.Duration(c.DrainTimeout),
 		minSuccessfulRehearsals: c.Release.MinSuccessfulRehearsals,
+		pairAdoption:            c.Release.PairAdoption,
 		coverageCategories:      append([]CoverageCategory(nil), c.Release.CoverageCategories...),
 		upstreams:               upstreams,
 		routes:                  routes,

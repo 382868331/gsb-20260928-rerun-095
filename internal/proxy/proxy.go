@@ -149,6 +149,22 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	rehearsalSource := request.Header.Get(release.RehearsalSourceHeader)
 	request.Header.Set(release.RehearsalHeader, releaseID)
 
+	// Paired rehearsal: the same business request runs on the baseline and
+	// on the candidate under one pair id, so both terminal outcomes can be
+	// explained as one pair of evidence.
+	pairID := request.Header.Get(release.PairHeader)
+	pairCandidateID, pairSide := "", ""
+	if pairID != "" {
+		if selection.CandidateID != "" {
+			pairCandidateID, pairSide = selection.CandidateID, release.PairSideCandidate
+		} else {
+			pairCandidateID, pairSide = p.releases.StagedCandidateID(), release.PairSideBaseline
+		}
+		if pairCandidateID != "" {
+			p.releases.BeginPairObservation(pairCandidateID, pairID, pairSide, entry.ID, rehearsalSource, entry.Method, entry.Path)
+		}
+	}
+
 	matched, ok := snapshot.Match(request)
 	if !ok {
 		entry.Status = http.StatusNotFound
@@ -156,6 +172,7 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		entry.Error = "no route matched"
 		p.records.Add(entry)
 		p.finishRehearsal(selection.CandidateID, entry, rehearsalSource)
+		p.finishPair(pairCandidateID, pairID, pairSide, entry, rehearsalSource)
 		http.Error(writer, "no route matched", http.StatusNotFound)
 		return
 	}
@@ -176,7 +193,26 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	entry.Duration = time.Since(started)
 	p.records.Add(entry)
 	p.finishRehearsal(selection.CandidateID, entry, rehearsalSource)
+	p.finishPair(pairCandidateID, pairID, pairSide, entry, rehearsalSource)
 	finish(status < 500 && errText == "", errText)
+}
+
+// finishPair feeds the terminal state of one side of a paired business
+// request back into the candidate's pair evidence.
+func (p *Proxy) finishPair(candidateID, pairID, side string, entry record.Record, source string) {
+	if candidateID == "" || pairID == "" {
+		return
+	}
+	p.releases.FinishPairObservation(candidateID, pairID, side, release.RehearsalOutcome{
+		RequestID: entry.ID,
+		Source:    source,
+		Method:    entry.Method,
+		Path:      entry.Path,
+		Status:    entry.Status,
+		Error:     entry.Error,
+		Canceled:  entry.Canceled,
+		Aborted:   entry.Aborted,
+	})
 }
 
 // finishRehearsal feeds the terminal state of a rehearsal request back into

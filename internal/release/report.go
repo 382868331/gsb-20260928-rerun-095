@@ -59,6 +59,161 @@ type CandidateReport struct {
 	Categories        []CategoryReport   `json:"categories"`
 	Supplements       []SupplementReport `json:"supplements"`
 	Evidence          []EvidenceEntry    `json:"evidence"`
+	// Pairing is present once any request carried a pair correlation id:
+	// it shows paired-valid, single-side and undetermined coverage, the
+	// collection rounds and every pair's adopted evidence.
+	Pairing *PairingReport `json:"pairing,omitempty"`
+}
+
+// PairingReport summarizes the paired baseline/candidate evidence of one
+// candidate: overall pair counts, per-category pair coverage, collection
+// rounds with their late-arrival decisions, and every pair in detail.
+type PairingReport struct {
+	Adoption   string               `json:"adoption"`
+	Overall    PairCounts           `json:"overall"`
+	Categories []CategoryPairReport `json:"categories"`
+	Rounds     []RoundReport        `json:"rounds"`
+	Pairs      []PairView           `json:"pairs"`
+}
+
+// CategoryPairReport shows one category's paired coverage: paired-valid,
+// single-side and undetermined samples side by side, plus adverse diffs
+// that a high-risk category can never hide behind other successes.
+type CategoryPairReport struct {
+	ID           string   `json:"id"`
+	HighRisk     bool     `json:"high_risk"`
+	Required     int64    `json:"required"`
+	PairedValid  int64    `json:"paired_valid"`
+	SingleSide   int64    `json:"single_side"`
+	Undetermined int64    `json:"undetermined"`
+	Adverse      int64    `json:"adverse"`
+	Satisfied    bool     `json:"satisfied"`
+	Reasons      []string `json:"reasons"`
+}
+
+// RoundReport describes one collection round: whether it still collects,
+// the explicit decision about its late arrivals, and how many pairs and
+// late attempts belong to it.
+type RoundReport struct {
+	Number          int    `json:"number"`
+	Open            bool   `json:"open"`
+	Decision        string `json:"decision,omitempty"`
+	Pairs           int64  `json:"pairs"`
+	LateAttempts    int64  `json:"late_attempts"`
+	PendingDecision bool   `json:"pending_decision"`
+}
+
+// PairView is the full trace of one business request: both sides' attempts
+// with their sources, the adopted outcomes, the live status and whether the
+// pair currently enters the release basis.
+type PairView struct {
+	ID         string       `json:"id"`
+	Round      int          `json:"round"`
+	Method     string       `json:"method"`
+	Path       string       `json:"path"`
+	Categories []string     `json:"categories"`
+	Status     string       `json:"status"`
+	InBasis    bool         `json:"in_basis"`
+	Conclusion string       `json:"conclusion,omitempty"`
+	Baseline   PairSideView `json:"baseline"`
+	Candidate  PairSideView `json:"candidate"`
+}
+
+// PairSideView shows one side's executions and which outcome is adopted.
+type PairSideView struct {
+	Attempts []PairAttempt `json:"attempts"`
+	Adopted  string        `json:"adopted,omitempty"`
+}
+
+// pairView renders one pair with live status and basis membership.
+func (c *Candidate) pairView(pair *Pair) PairView {
+	view := PairView{
+		ID:         pair.ID,
+		Round:      pair.Round,
+		Method:     pair.Method,
+		Path:       pair.Path,
+		Categories: append([]string(nil), pair.Categories...),
+		Status:     c.liveStatus(pair),
+		Baseline:   c.pairSideView(pair, PairSideBaseline),
+		Candidate:  c.pairSideView(pair, PairSideCandidate),
+	}
+	basisStatus := c.basisStatus(pair)
+	view.InBasis = basisStatus == PairStatusPaired
+	if basisStatus == PairStatusPaired {
+		baseline := adopt(c.basisAttempts(pair, PairSideBaseline), c.PairAdoption)
+		candidate := adopt(c.basisAttempts(pair, PairSideCandidate), c.PairAdoption)
+		view.Conclusion = pairConclusion(baseline, candidate)
+	}
+	return view
+}
+
+func (c *Candidate) pairSideView(pair *Pair, side string) PairSideView {
+	attempts := *pair.sideAttempts(side)
+	view := PairSideView{Attempts: append([]PairAttempt(nil), attempts...)}
+	if view.Attempts == nil {
+		view.Attempts = []PairAttempt{}
+	}
+	if chosen := adopt(attempts, c.PairAdoption); chosen != nil {
+		view.Adopted = chosen.Outcome
+	}
+	return view
+}
+
+// pairingReportLocked builds the paired-evidence section of the report.
+func (c *Candidate) pairingReportLocked() *PairingReport {
+	report := &PairingReport{
+		Adoption:   c.PairAdoption,
+		Overall:    c.pairCountsLocked(),
+		Categories: []CategoryPairReport{},
+		Rounds:     []RoundReport{},
+		Pairs:      []PairView{},
+	}
+	for _, category := range c.CoveragePlan {
+		counts := c.pairCountsLocked(category.ID)
+		entry := CategoryPairReport{
+			ID:           category.ID,
+			HighRisk:     category.HighRisk,
+			Required:     int64(category.MinSamples),
+			PairedValid:  counts.PairedValid,
+			SingleSide:   counts.SingleSide,
+			Undetermined: counts.Undetermined,
+			Adverse:      counts.Adverse,
+			Reasons:      []string{},
+		}
+		if counts.PairedValid < entry.Required {
+			entry.Reasons = append(entry.Reasons, fmt.Sprintf("paired valid samples %d/%d: %d missing",
+				counts.PairedValid, entry.Required, entry.Required-counts.PairedValid))
+		}
+		if category.HighRisk && counts.Adverse > 0 {
+			entry.Reasons = append(entry.Reasons, fmt.Sprintf("high-risk category has %d adverse pair(s)", counts.Adverse))
+		}
+		entry.Satisfied = len(entry.Reasons) == 0
+		report.Categories = append(report.Categories, entry)
+	}
+	lateByRound := map[int]int64{}
+	pairsByRound := map[int]int64{}
+	for _, pair := range c.pairs {
+		pairsByRound[pair.Round]++
+		for _, side := range []PairSide{pair.Baseline, pair.Candidate} {
+			for _, attempt := range side.Attempts {
+				if attempt.Late {
+					lateByRound[pair.Round]++
+				}
+			}
+		}
+		report.Pairs = append(report.Pairs, c.pairView(pair))
+	}
+	for _, round := range c.Rounds {
+		report.Rounds = append(report.Rounds, RoundReport{
+			Number:          round.Number,
+			Open:            round.Open,
+			Decision:        round.Decision,
+			Pairs:           pairsByRound[round.Number],
+			LateAttempts:    lateByRound[round.Number],
+			PendingDecision: !round.Open && round.Decision == "" && lateByRound[round.Number] > 0,
+		})
+	}
+	return report
 }
 
 // Report builds the rehearsal report for one candidate, including resolved
@@ -79,6 +234,9 @@ func (s *Store) Report(candidateID string) (CandidateReport, error) {
 		Categories:    candidate.categoryReportsLocked(s.active, s.activeID),
 		Supplements:   supplementReports(candidate.Evidence),
 		Evidence:      append([]EvidenceEntry(nil), candidate.Evidence...),
+	}
+	if len(candidate.pairs) > 0 {
+		report.Pairing = candidate.pairingReportLocked()
 	}
 	switch candidate.State {
 	case StateSuperseded:

@@ -24,6 +24,12 @@ const RehearsalHeader = "X-Gateway-Release"
 // use a distinct source so the report keeps each batch's origin and result.
 const RehearsalSourceHeader = "X-Gateway-Rehearsal-Source"
 
+// PairHeader correlates the baseline and candidate executions of the same
+// business request. Both sides carry the same pair id so their terminal
+// outcomes can be explained as one pair of evidence instead of two
+// independently picked samples.
+const PairHeader = "X-Gateway-Pair"
+
 type Kind string
 
 const (
@@ -122,6 +128,9 @@ type Release struct {
 	Fingerprint string            `json:"fingerprint"`
 	Rehearsal   *RehearsalSummary `json:"rehearsal,omitempty"`
 	Coverage    []CategoryReport  `json:"coverage,omitempty"`
+	// Pairs lists the adopted request pairs behind every release
+	// conclusion, so the decision stays traceable to concrete evidence.
+	Pairs []PairConclusion `json:"pairs,omitempty"`
 
 	snapshot *config.Snapshot
 }
@@ -142,12 +151,19 @@ type Candidate struct {
 	Coverage      map[string]*CategoryStats `json:"coverage"`
 	Evidence      []EvidenceEntry           `json:"evidence"`
 	Readiness     Readiness                 `json:"readiness"`
+	// PairAdoption is the evidence adoption rule fixed when the candidate
+	// was staged; it is part of the fingerprint, so changing it supersedes
+	// this revision instead of letting anyone swap unfavorable results.
+	PairAdoption string       `json:"pair_adoption"`
+	Rounds       []*PairRound `json:"rounds"`
 	// InvalidatedBy names the newer revision that voided this candidate's
 	// evidence, so old reports explain why their release basis expired.
 	InvalidatedBy string `json:"invalidated_by,omitempty"`
 
 	snapshot *config.Snapshot
 	seen     map[string]struct{}
+	pairs    []*Pair
+	pairByID map[string]*Pair
 }
 
 // RehearsalOutcome reports how one pinned rehearsal request ended.
@@ -358,11 +374,14 @@ func (s *Store) Stage(snapshot *config.Snapshot) Candidate {
 		PlanConfirmed: len(plan) == 0,
 		Coverage:      coverage,
 		Evidence:      []EvidenceEntry{},
+		PairAdoption:  snapshot.PairAdoption(),
+		Rounds:        []*PairRound{{Number: 1, Open: true}},
 		Rehearsal: RehearsalSummary{
 			RequiredSuccesses: int64(snapshot.MinSuccessfulRehearsals()),
 		},
 		snapshot: snapshot,
 		seen:     make(map[string]struct{}),
+		pairByID: make(map[string]*Pair),
 	}
 	s.candidates[candidate.ID] = candidate
 	for _, existing := range s.candidates {
@@ -412,6 +431,7 @@ func (s *Store) Confirm(candidateID string) (Release, error) {
 	candidate.ResolvedAt = time.Now()
 	release := s.appendReleaseLocked(KindPromote, candidate.ID, candidate.snapshot, &summary)
 	release.Coverage = candidate.categoryReportsLocked(s.active, s.activeID)
+	release.Pairs = candidate.pairConclusionsLocked()
 	s.history[len(s.history)-1] = release
 	s.active = candidate.snapshot
 	s.activeID = release.ID
@@ -519,6 +539,13 @@ func (s *Store) Candidates() []Candidate {
 
 func (c *Candidate) readinessLocked() Readiness {
 	readiness := Readiness{State: c.State, Summary: c.Rehearsal}
+	// Paired-valid business requests are successful candidate executions
+	// too: they satisfy the minimum successful rehearsal count alongside
+	// plain rehearsal traffic.
+	succeeded := c.Rehearsal.Succeeded
+	if len(c.pairs) > 0 {
+		succeeded += c.pairCountsLocked().PairedValid
+	}
 	switch c.State {
 	case StateStaged:
 		switch {
@@ -527,21 +554,41 @@ func (c *Candidate) readinessLocked() Readiness {
 		case c.Rehearsal.InFlight > 0:
 			readiness.State = StateRehearsing
 			readiness.Reason = fmt.Sprintf("rehearsal in progress: %d request(s) still running", c.Rehearsal.InFlight)
-		case c.Rehearsal.Succeeded < c.Rehearsal.RequiredSuccesses &&
+		case len(c.pairs) > 0 && c.pairCountsLocked().Undetermined > 0:
+			// Undetermined pairs (one side in flight or lost) must settle
+			// before any release conclusion is drawn from them.
+			readiness.State = StateRehearsing
+			readiness.Reason = fmt.Sprintf("pairing undetermined: %d request pair(s) still waiting for one or both sides",
+				c.pairCountsLocked().Undetermined)
+		case len(c.pairs) > 0 && c.pairCoverageShortfallLocked() != "":
+			// Once paired evidence exists, category coverage is judged on
+			// adopted request pairs only; single-sided rehearsals cannot be
+			// cherry-picked into a pair, and adverse high-risk diffs cannot
+			// be averaged away.
+			readiness.State = StateInsufficient
+			readiness.Reason = c.pairCoverageShortfallLocked()
+		case succeeded < c.Rehearsal.RequiredSuccesses &&
 			(c.Rehearsal.Failed > 0 || c.Rehearsal.Canceled > 0 || c.Rehearsal.Aborted > 0):
 			readiness.State = StateInsufficient
 			readiness.Reason = fmt.Sprintf("rehearsal did not pass: %d failed, %d canceled, %d aborted",
 				c.Rehearsal.Failed, c.Rehearsal.Canceled, c.Rehearsal.Aborted)
-		case c.Rehearsal.Succeeded < c.Rehearsal.RequiredSuccesses:
+		case succeeded < c.Rehearsal.RequiredSuccesses:
 			readiness.State = StateInsufficient
 			readiness.Reason = fmt.Sprintf("rehearsal incomplete: %d/%d successful request(s)",
-				c.Rehearsal.Succeeded, c.Rehearsal.RequiredSuccesses)
+				succeeded, c.Rehearsal.RequiredSuccesses)
 		default:
 			readiness.State = StateReady
 			readiness.Ready = true
 		}
 		if readiness.Ready {
-			if reason := c.coverageShortfallLocked(); reason != "" {
+			// Once paired evidence exists, category coverage is judged on
+			// adopted request pairs only; single-sided rehearsals cannot be
+			// cherry-picked into a pair.
+			reason := c.coverageShortfallLocked()
+			if len(c.pairs) > 0 {
+				reason = c.pairCoverageShortfallLocked()
+			}
+			if reason != "" {
 				readiness.State = StateInsufficient
 				readiness.Ready = false
 				readiness.Reason = reason
@@ -611,10 +658,12 @@ func Fingerprint(snapshot *config.Snapshot) string {
 		Upstreams []config.Upstream         `json:"upstreams"`
 		Routes    []config.Route            `json:"routes"`
 		Coverage  []config.CoverageCategory `json:"coverage"`
+		Adoption  string                    `json:"adoption"`
 	}{
 		Upstreams: snapshot.Upstreams(),
 		Routes:    snapshot.Routes(),
 		Coverage:  snapshot.CoverageCategories(),
+		Adoption:  snapshot.PairAdoption(),
 	}
 	data, _ := json.Marshal(payload)
 	sum := sha256.Sum256(data)

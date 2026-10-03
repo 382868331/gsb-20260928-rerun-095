@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"gateway/internal/record"
@@ -80,6 +81,11 @@ func (a *Admin) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	case request.Method == http.MethodPost && strings.HasPrefix(relative, "/candidates/") && strings.HasSuffix(relative, "/discard"):
 		id := strings.TrimSuffix(strings.TrimPrefix(relative, "/candidates/"), "/discard")
 		a.handleDiscard(writer, id)
+	case request.Method == http.MethodPost && strings.HasPrefix(relative, "/candidates/") && strings.HasSuffix(relative, "/rounds/close"):
+		id := strings.TrimSuffix(strings.TrimPrefix(relative, "/candidates/"), "/rounds/close")
+		a.handleCloseRound(writer, id)
+	case request.Method == http.MethodPost && strings.HasPrefix(relative, "/candidates/") && strings.Contains(relative, "/rounds/") && strings.HasSuffix(relative, "/decision"):
+		a.handleRoundDecision(writer, request, relative)
 	case request.Method == http.MethodPost && relative == "/rollback":
 		a.handleRollback(writer, request)
 	default:
@@ -168,6 +174,47 @@ func (a *Admin) handleDiscard(writer http.ResponseWriter, candidateID string) {
 		return
 	}
 	a.writeJSON(writer, http.StatusOK, discarded)
+}
+
+// handleCloseRound ends the candidate's current collection round and lists
+// the requests whose baseline/candidate pair is still incomplete.
+func (a *Admin) handleCloseRound(writer http.ResponseWriter, candidateID string) {
+	closed, err := a.releases.CloseRound(candidateID)
+	if err != nil {
+		a.writeCandidateError(writer, err)
+		return
+	}
+	a.writeJSON(writer, http.StatusOK, closed)
+}
+
+// handleRoundDecision records the explicit decision whether late arrivals
+// of a closed round enter the confirmed release basis: POST
+// /candidates/<id>/rounds/<n>/decision with {"adopt": true|false}.
+func (a *Admin) handleRoundDecision(writer http.ResponseWriter, request *http.Request, relative string) {
+	rest := strings.TrimSuffix(strings.TrimPrefix(relative, "/candidates/"), "/decision")
+	parts := strings.Split(rest, "/rounds/")
+	if len(parts) != 2 {
+		a.writeJSON(writer, http.StatusNotFound, map[string]string{"error": "unknown admin endpoint"})
+		return
+	}
+	round, err := strconv.Atoi(parts[1])
+	if err != nil {
+		a.writeJSON(writer, http.StatusBadRequest, map[string]string{"error": "invalid round number"})
+		return
+	}
+	var body struct {
+		Adopt *bool `json:"adopt"`
+	}
+	if err := json.NewDecoder(request.Body).Decode(&body); err != nil || body.Adopt == nil {
+		a.writeJSON(writer, http.StatusBadRequest, map[string]string{"error": "body must be a JSON object with an adopt boolean"})
+		return
+	}
+	candidate, err := a.releases.DecideRound(parts[0], round, *body.Adopt)
+	if err != nil {
+		a.writeCandidateError(writer, err)
+		return
+	}
+	a.writeJSON(writer, http.StatusOK, candidate)
 }
 
 // writeCandidateError maps gating failures to 409 and unknown candidates to
