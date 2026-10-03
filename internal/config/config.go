@@ -28,7 +28,20 @@ type Config struct {
 type ReleasePolicy struct {
 	MinSuccessfulRehearsals int                `json:"min_successful_rehearsals"`
 	CoverageCategories      []CoverageCategory `json:"coverage_categories"`
+	// EvidencePolicy fixes how repeated executions of one interrupted
+	// business request are adopted before rehearsal starts. The only
+	// supported policy is "first_terminal" (default): the first terminal
+	// execution of each side is the adopted evidence and a later retry can
+	// never replace an unfavorable result. Changing the policy changes the
+	// candidate fingerprint and opens a new review version.
+	EvidencePolicy string `json:"evidence_policy"`
 }
+
+const (
+	// EvidencePolicyFirstTerminal adopts the first terminal execution of
+	// each side (baseline/candidate) of a business request.
+	EvidencePolicyFirstTerminal = "first_terminal"
+)
 
 // CoverageCategory defines one business category of requests that a
 // candidate must cover with valid rehearsal samples before release. A
@@ -114,6 +127,7 @@ type Snapshot struct {
 	DrainTimeout            time.Duration
 	minSuccessfulRehearsals int
 	coverageCategories      []CoverageCategory
+	evidencePolicy          string
 	upstreams               map[string]*Upstream
 	routes                  []matchedRoute
 }
@@ -152,6 +166,15 @@ func (s *Snapshot) CoverageCategories() []CoverageCategory {
 	result := make([]CoverageCategory, len(s.coverageCategories))
 	copy(result, s.coverageCategories)
 	return result
+}
+
+// EvidencePolicy returns the evidence adoption policy fixed before the
+// rehearsal of a candidate built from this snapshot starts.
+func (s *Snapshot) EvidencePolicy() string {
+	if s.evidencePolicy == "" {
+		return EvidencePolicyFirstTerminal
+	}
+	return s.evidencePolicy
 }
 
 // Routes returns the configured routes in declaration order.
@@ -216,6 +239,12 @@ func (c *Config) Snapshot() (*Snapshot, error) {
 	}
 	if c.Release.MinSuccessfulRehearsals < 0 {
 		return nil, errors.New("release.min_successful_rehearsals must not be negative")
+	}
+	if c.Release.EvidencePolicy == "" {
+		c.Release.EvidencePolicy = EvidencePolicyFirstTerminal
+	}
+	if c.Release.EvidencePolicy != EvidencePolicyFirstTerminal {
+		return nil, fmt.Errorf("release.evidence_policy %q is not supported", c.Release.EvidencePolicy)
 	}
 	seenCategories := make(map[string]struct{}, len(c.Release.CoverageCategories))
 	for _, category := range c.Release.CoverageCategories {
@@ -296,6 +325,7 @@ func (c *Config) Snapshot() (*Snapshot, error) {
 		DrainTimeout:            time.Duration(c.DrainTimeout),
 		minSuccessfulRehearsals: c.Release.MinSuccessfulRehearsals,
 		coverageCategories:      append([]CoverageCategory(nil), c.Release.CoverageCategories...),
+		evidencePolicy:          c.Release.EvidencePolicy,
 		upstreams:               upstreams,
 		routes:                  routes,
 	}, nil

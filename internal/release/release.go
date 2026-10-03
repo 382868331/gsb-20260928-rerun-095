@@ -74,6 +74,13 @@ type RehearsalSummary struct {
 	Canceled          int64 `json:"canceled"`
 	Aborted           int64 `json:"aborted"`
 	Invalid           int64 `json:"invalid"`
+	// PairCoverage breaks evidence down by how well the baseline and
+	// candidate sides of the same business request explain each other.
+	PairedTotal   int64 `json:"paired_total"`
+	PairedValid   int64 `json:"paired_valid"`
+	PairedAdverse int64 `json:"paired_adverse"`
+	SingleSided   int64 `json:"single_sided"`
+	Undecided     int64 `json:"undecided"`
 }
 
 // CategoryStats accumulates per-category rehearsal outcomes. Only
@@ -93,14 +100,21 @@ type CategoryStats struct {
 // bare counters. Source identifies which rehearsal batch (initial run or a
 // named supplement) produced the sample.
 type EvidenceEntry struct {
-	RequestID  string    `json:"request_id"`
-	Source     string    `json:"source"`
-	Method     string    `json:"method"`
-	Path       string    `json:"path"`
-	Categories []string  `json:"categories"`
-	Outcome    string    `json:"outcome"`
-	Counted    bool      `json:"counted"`
-	At         time.Time `json:"at"`
+	RequestID   string    `json:"request_id"`
+	BusinessID  string    `json:"business_id,omitempty"`
+	Side        Side      `json:"side,omitempty"`
+	Attempt     int       `json:"attempt,omitempty"`
+	Round       string    `json:"round,omitempty"`
+	Source      string    `json:"source"`
+	Method      string    `json:"method"`
+	Path        string    `json:"path"`
+	Categories  []string  `json:"categories"`
+	Outcome     string    `json:"outcome"`
+	Counted     bool      `json:"counted"`
+	Adopted     bool      `json:"adopted,omitempty"`
+	Late        bool      `json:"late,omitempty"`
+	Conclusion  string    `json:"conclusion,omitempty"`
+	At          time.Time `json:"at"`
 }
 
 // Readiness explains whether a candidate is releasable and why.
@@ -122,6 +136,12 @@ type Release struct {
 	Fingerprint string            `json:"fingerprint"`
 	Rehearsal   *RehearsalSummary `json:"rehearsal,omitempty"`
 	Coverage    []CategoryReport  `json:"coverage,omitempty"`
+	// ReviewVersion identifies the category/evidence rule set under which
+	// the adopted pairs were gathered; every release conclusion points at
+	// the concrete request pairs it was built from.
+	ReviewVersion int              `json:"review_version"`
+	EvidencePolicy string          `json:"evidence_policy,omitempty"`
+	AdoptedPairs  []AdoptedPairRef `json:"adopted_pairs,omitempty"`
 
 	snapshot *config.Snapshot
 }
@@ -142,6 +162,17 @@ type Candidate struct {
 	Coverage      map[string]*CategoryStats `json:"coverage"`
 	Evidence      []EvidenceEntry           `json:"evidence"`
 	Readiness     Readiness                 `json:"readiness"`
+	// EvidencePolicy is the adoption policy fixed before rehearsal
+	// starts; retries can never replace the first terminal result later.
+	EvidencePolicy string `json:"evidence_policy"`
+	// ReviewVersion identifies the category/evidence rule set; changing
+	// either opens a new version and supersedes the prior candidate.
+	ReviewVersion int `json:"review_version"`
+	pairs         map[string]*BusinessPair
+	rounds        []*CollectionRound
+	currentRound  *CollectionRound
+	roundSeq      int
+	lateDecisions []LateDecision
 	// InvalidatedBy names the newer revision that voided this candidate's
 	// evidence, so old reports explain why their release basis expired.
 	InvalidatedBy string `json:"invalidated_by,omitempty"`
@@ -160,6 +191,9 @@ type RehearsalOutcome struct {
 	Error     string
 	Canceled  bool
 	Aborted   bool
+	BusinessID string
+	Side       Side
+	Attempt    int
 }
 
 type Store struct {
@@ -222,44 +256,43 @@ func (s *Store) Select(request *http.Request) Selection {
 // RequestID is logged as evidence but never double-counted, so resumed or
 // supplemented rehearsals cannot inflate coverage with duplicate samples.
 func (s *Store) FinishRehearsal(candidateID string, outcome RehearsalOutcome) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	candidate, ok := s.candidates[candidateID]
-	if !ok {
-		return
-	}
-	if candidate.Rehearsal.InFlight > 0 {
-		candidate.Rehearsal.InFlight--
-	}
-	kind := classifyOutcome(outcome)
+	outcome.Side = SideCandidate
+	_ = s.RecordExecution(candidateID, outcome)
+}
+
+// legacyFinishLocked records a rehearsal outcome that carries no business
+// correlation. Such entries stay visible in the evidence trail and legacy
+// counters but cannot form a paired comparison and therefore never count as
+// paired coverage.
+func (c *Candidate) legacyFinishLocked(outcome RehearsalOutcome, kind string) {
 	counted := true
 	if outcome.RequestID != "" {
-		if _, seen := candidate.seen[outcome.RequestID]; seen {
+		if _, seen := c.seen[outcome.RequestID]; seen {
 			counted = false
 		} else {
-			candidate.seen[outcome.RequestID] = struct{}{}
+			c.seen[outcome.RequestID] = struct{}{}
 		}
 	}
 	source := outcome.Source
 	if source == "" {
 		source = "rehearsal"
 	}
-	categories := matchedCategories(candidate.snapshot, outcome.Method, outcome.Path)
+	categories := matchedCategories(c.snapshot, outcome.Method, outcome.Path)
 	if counted {
 		switch kind {
 		case "succeeded":
-			candidate.Rehearsal.Succeeded++
+			c.Rehearsal.Succeeded++
 		case "failed":
-			candidate.Rehearsal.Failed++
+			c.Rehearsal.Failed++
 		case "canceled":
-			candidate.Rehearsal.Canceled++
+			c.Rehearsal.Canceled++
 		case "aborted":
-			candidate.Rehearsal.Aborted++
+			c.Rehearsal.Aborted++
 		case "invalid":
-			candidate.Rehearsal.Invalid++
+			c.Rehearsal.Invalid++
 		}
 		for _, id := range categories {
-			stats := candidate.Coverage[id]
+			stats := c.Coverage[id]
 			if stats == nil {
 				continue
 			}
@@ -277,10 +310,10 @@ func (s *Store) FinishRehearsal(candidateID string, outcome RehearsalOutcome) {
 			}
 		}
 	}
-	if candidate.Evidence == nil {
-		candidate.Evidence = []EvidenceEntry{}
+	if c.Evidence == nil {
+		c.Evidence = []EvidenceEntry{}
 	}
-	candidate.Evidence = append(candidate.Evidence, EvidenceEntry{
+	c.Evidence = append(c.Evidence, EvidenceEntry{
 		RequestID:  outcome.RequestID,
 		Source:     source,
 		Method:     outcome.Method,
