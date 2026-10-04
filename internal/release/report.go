@@ -59,6 +59,12 @@ type CandidateReport struct {
 	Categories        []CategoryReport   `json:"categories"`
 	Supplements       []SupplementReport `json:"supplements"`
 	Evidence          []EvidenceEntry    `json:"evidence"`
+	// Pairs, Rounds and LateDecisions keep the paired-evidence trail
+	// auditable: which request pairs were adopted, in which collection
+	// round, and how late arrivals after round close were handled.
+	Pairs         []BusinessPair    `json:"pairs,omitempty"`
+	Rounds        []CollectionRound `json:"rounds,omitempty"`
+	LateDecisions []LateDecision    `json:"late_decisions,omitempty"`
 }
 
 // Report builds the rehearsal report for one candidate, including resolved
@@ -79,6 +85,9 @@ func (s *Store) Report(candidateID string) (CandidateReport, error) {
 		Categories:    candidate.categoryReportsLocked(s.active, s.activeID),
 		Supplements:   supplementReports(candidate.Evidence),
 		Evidence:      append([]EvidenceEntry(nil), candidate.Evidence...),
+		Pairs:         candidate.pairViewsLocked(),
+		Rounds:        candidate.roundViewsLocked(),
+		LateDecisions: candidate.lateDecisionsLocked(),
 	}
 	switch candidate.State {
 	case StateSuperseded:
