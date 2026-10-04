@@ -88,6 +88,26 @@ curl -X POST 'http://127.0.0.1:8080/__gateway/rollback?release=rel-1'
 - 补充尚未覆盖的类别时，给演练请求加 `X-Gateway-Rehearsal-Source: <批次名>` 头；报告按来源保留每次补充的来源与结果。中途停止后继续演练时证据保留在同一候选上，按请求 ID 去重，最终发布判断使用同一组可追溯证据，无法靠重复样本或挑选有利结果通过。
 - 调整类别规则或覆盖要求会改变候选指纹：在途候选立即 `superseded`，旧证据不再可作为发布依据；旧报告仍可查看，并明确标注失效原因（被哪个修订取代或已放弃）。发布记录中保存当时的各类别覆盖结果。
 
+## 配对证据与收集轮次
+
+需要按同一业务请求对比现役发布和候选时，给两侧请求设置相同的 `X-Gateway-Business-ID`；候选侧仍携带 `X-Gateway-Release: <candidate-id>`，基线侧额外携带 `X-Gateway-Execution-Side: baseline`。两侧请求可分别设置 `X-Gateway-Collection-Round: round-N`，未显式指定时归入候选当前打开的轮次。
+
+```bash
+curl -X POST http://127.0.0.1:8080/__gateway/candidates/cand-1/rounds/start
+curl -H 'X-Gateway-Release: cand-1' \
+  -H 'X-Gateway-Business-ID: order-42' \
+  -H 'X-Gateway-Execution-Side: baseline' \
+  http://127.0.0.1:8080/v1/orders/42
+curl -H 'X-Gateway-Release: cand-1' \
+  -H 'X-Gateway-Business-ID: order-42' \
+  http://127.0.0.1:8080/v1/orders/42
+curl -X POST http://127.0.0.1:8080/__gateway/candidates/cand-1/rounds/close
+```
+
+- 每个业务 ID 形成一个基线/候选请求对；一侧的首个终态结果被采用，后续重试只保留为证据，不能覆盖失败等不利结果。
+- 一个请求同时命中多个类别时，整体只计一次配对成功，各类别分别获得一个去重样本；报告中的 `pair_refs` 和发布记录中的 `adopted_pairs` 都保存业务 ID、轮次及两侧 request ID。
+- 轮次关闭后，未集齐两侧的请求标记为 `undecided`；之后才到达且声明该轮次的执行标记为 `late_ignored`，写入 `late_decisions`，不会改变关闭时的结论。
+
 ## 优雅关停
 
 服务收到 `SIGTERM` 后停止接受新请求（新请求得到 `503 gateway draining`），在途请求在 `drain_timeout` 内按约定收尾；超出等待范围的请求被取消并记录 `aborted=true`、`error="shutdown deadline exceeded"` 的明确终态。

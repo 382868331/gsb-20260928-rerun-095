@@ -11,6 +11,8 @@ type Record struct {
 	Duration      time.Duration `json:"duration"`
 	RouteID       string        `json:"route_id"`
 	ReleaseID     string        `json:"release_id"`
+	BusinessID    string        `json:"business_id,omitempty"`
+	Side          string        `json:"side,omitempty"`
 	Version       string        `json:"version"`
 	UpstreamID    string        `json:"upstream_id"`
 	Method        string        `json:"method"`

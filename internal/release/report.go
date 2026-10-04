@@ -58,6 +58,9 @@ type CandidateReport struct {
 	Overall           RehearsalSummary   `json:"overall"`
 	Categories        []CategoryReport   `json:"categories"`
 	Supplements       []SupplementReport `json:"supplements"`
+	Rounds            []CollectionRound  `json:"rounds,omitempty"`
+	LateDecisions     []LateDecision     `json:"late_decisions,omitempty"`
+	PairRefs          []AdoptedPairRef   `json:"pair_refs,omitempty"`
 	Evidence          []EvidenceEntry    `json:"evidence"`
 }
 
@@ -78,6 +81,9 @@ func (s *Store) Report(candidateID string) (CandidateReport, error) {
 		Overall:       candidate.Rehearsal,
 		Categories:    candidate.categoryReportsLocked(s.active, s.activeID),
 		Supplements:   supplementReports(candidate.Evidence),
+		Rounds:        collectionRoundViews(candidate.rounds),
+		LateDecisions: append([]LateDecision(nil), candidate.lateDecisions...),
+		PairRefs:      candidate.pairRefsLocked(),
 		Evidence:      append([]EvidenceEntry(nil), candidate.Evidence...),
 	}
 	switch candidate.State {
@@ -208,4 +214,12 @@ func containsString(list []string, value string) bool {
 		}
 	}
 	return false
+}
+
+func collectionRoundViews(rounds []*CollectionRound) []CollectionRound {
+	result := make([]CollectionRound, 0, len(rounds))
+	for _, round := range rounds {
+		result = append(result, *round)
+	}
+	return result
 }

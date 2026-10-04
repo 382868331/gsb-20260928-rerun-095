@@ -74,6 +74,12 @@ func (a *Admin) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	case request.Method == http.MethodPost && strings.HasPrefix(relative, "/candidates/") && strings.HasSuffix(relative, "/coverage/confirm"):
 		id := strings.TrimSuffix(strings.TrimPrefix(relative, "/candidates/"), "/coverage/confirm")
 		a.handleConfirmPlan(writer, id)
+	case request.Method == http.MethodPost && strings.HasPrefix(relative, "/candidates/") && strings.HasSuffix(relative, "/rounds/start"):
+		id := strings.TrimSuffix(strings.TrimPrefix(relative, "/candidates/"), "/rounds/start")
+		a.handleStartRound(writer, id)
+	case request.Method == http.MethodPost && strings.HasPrefix(relative, "/candidates/") && strings.HasSuffix(relative, "/rounds/close"):
+		id := strings.TrimSuffix(strings.TrimPrefix(relative, "/candidates/"), "/rounds/close")
+		a.handleCloseRound(writer, id)
 	case request.Method == http.MethodPost && strings.HasPrefix(relative, "/candidates/") && strings.HasSuffix(relative, "/confirm"):
 		id := strings.TrimSuffix(strings.TrimPrefix(relative, "/candidates/"), "/confirm")
 		a.handleConfirm(writer, id)
@@ -168,6 +174,24 @@ func (a *Admin) handleDiscard(writer http.ResponseWriter, candidateID string) {
 		return
 	}
 	a.writeJSON(writer, http.StatusOK, discarded)
+}
+
+func (a *Admin) handleStartRound(writer http.ResponseWriter, candidateID string) {
+	round, err := a.releases.StartCollectionRound(candidateID)
+	if err != nil {
+		a.writeCandidateError(writer, err)
+		return
+	}
+	a.writeJSON(writer, http.StatusOK, round)
+}
+
+func (a *Admin) handleCloseRound(writer http.ResponseWriter, candidateID string) {
+	round, err := a.releases.CloseCollectionRound(candidateID)
+	if err != nil {
+		a.writeCandidateError(writer, err)
+		return
+	}
+	a.writeJSON(writer, http.StatusOK, round)
 }
 
 // writeCandidateError maps gating failures to 409 and unknown candidates to

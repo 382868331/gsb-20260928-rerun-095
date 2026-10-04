@@ -147,6 +147,11 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	releaseID := selection.ID
 	entry.ReleaseID = releaseID
 	rehearsalSource := request.Header.Get(release.RehearsalSourceHeader)
+	businessID := request.Header.Get(release.BusinessIDHeader)
+	executionSide := release.ParseExecutionSide(request.Header.Get(release.ExecutionSideHeader))
+	collectionRound := request.Header.Get(release.CollectionRoundHeader)
+	entry.BusinessID = businessID
+	entry.Side = string(executionSide)
 	request.Header.Set(release.RehearsalHeader, releaseID)
 
 	matched, ok := snapshot.Match(request)
@@ -155,7 +160,7 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		entry.Duration = time.Since(started)
 		entry.Error = "no route matched"
 		p.records.Add(entry)
-		p.finishRehearsal(selection.CandidateID, entry, rehearsalSource)
+		p.finishRehearsal(selection.CandidateID, entry, rehearsalSource, businessID, executionSide, collectionRound)
 		http.Error(writer, "no route matched", http.StatusNotFound)
 		return
 	}
@@ -175,26 +180,33 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	entry.Aborted = aborted
 	entry.Duration = time.Since(started)
 	p.records.Add(entry)
-	p.finishRehearsal(selection.CandidateID, entry, rehearsalSource)
+	p.finishRehearsal(selection.CandidateID, entry, rehearsalSource, businessID, executionSide, collectionRound)
 	finish(status < 500 && errText == "", errText)
 }
 
 // finishRehearsal feeds the terminal state of a rehearsal request back into
 // the candidate's evidence. Only requests pinned to a staged candidate at
 // entry are counted; normal traffic is ignored.
-func (p *Proxy) finishRehearsal(candidateID string, entry record.Record, source string) {
+func (p *Proxy) finishRehearsal(candidateID string, entry record.Record, source string, businessID string, side release.Side, collectionRound string) {
 	if candidateID == "" {
 		return
 	}
-	p.releases.FinishRehearsal(candidateID, release.RehearsalOutcome{
-		RequestID: entry.ID,
-		Source:    source,
-		Method:    entry.Method,
-		Path:      entry.Path,
-		Status:    entry.Status,
-		Error:     entry.Error,
-		Canceled:  entry.Canceled,
-		Aborted:   entry.Aborted,
+	if businessID == "" && side == release.SideBaseline {
+		return
+	}
+	_ = p.releases.RecordExecution(candidateID, release.RehearsalOutcome{
+		RequestID:  entry.ID,
+		Source:     source,
+		Method:     entry.Method,
+		Path:       entry.Path,
+		Status:     entry.Status,
+		Error:      entry.Error,
+		Canceled:   entry.Canceled,
+		Aborted:    entry.Aborted,
+		BusinessID: businessID,
+		Side:       side,
+		Attempt:    entry.Attempts,
+		Round:      collectionRound,
 	})
 }
 

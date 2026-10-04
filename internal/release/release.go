@@ -100,21 +100,21 @@ type CategoryStats struct {
 // bare counters. Source identifies which rehearsal batch (initial run or a
 // named supplement) produced the sample.
 type EvidenceEntry struct {
-	RequestID   string    `json:"request_id"`
-	BusinessID  string    `json:"business_id,omitempty"`
-	Side        Side      `json:"side,omitempty"`
-	Attempt     int       `json:"attempt,omitempty"`
-	Round       string    `json:"round,omitempty"`
-	Source      string    `json:"source"`
-	Method      string    `json:"method"`
-	Path        string    `json:"path"`
-	Categories  []string  `json:"categories"`
-	Outcome     string    `json:"outcome"`
-	Counted     bool      `json:"counted"`
-	Adopted     bool      `json:"adopted,omitempty"`
-	Late        bool      `json:"late,omitempty"`
-	Conclusion  string    `json:"conclusion,omitempty"`
-	At          time.Time `json:"at"`
+	RequestID  string    `json:"request_id"`
+	BusinessID string    `json:"business_id,omitempty"`
+	Side       Side      `json:"side,omitempty"`
+	Attempt    int       `json:"attempt,omitempty"`
+	Round      string    `json:"round,omitempty"`
+	Source     string    `json:"source"`
+	Method     string    `json:"method"`
+	Path       string    `json:"path"`
+	Categories []string  `json:"categories"`
+	Outcome    string    `json:"outcome"`
+	Counted    bool      `json:"counted"`
+	Adopted    bool      `json:"adopted,omitempty"`
+	Late       bool      `json:"late,omitempty"`
+	Conclusion string    `json:"conclusion,omitempty"`
+	At         time.Time `json:"at"`
 }
 
 // Readiness explains whether a candidate is releasable and why.
@@ -139,9 +139,9 @@ type Release struct {
 	// ReviewVersion identifies the category/evidence rule set under which
 	// the adopted pairs were gathered; every release conclusion points at
 	// the concrete request pairs it was built from.
-	ReviewVersion int              `json:"review_version"`
-	EvidencePolicy string          `json:"evidence_policy,omitempty"`
-	AdoptedPairs  []AdoptedPairRef `json:"adopted_pairs,omitempty"`
+	ReviewVersion  int              `json:"review_version"`
+	EvidencePolicy string           `json:"evidence_policy,omitempty"`
+	AdoptedPairs   []AdoptedPairRef `json:"adopted_pairs,omitempty"`
 
 	snapshot *config.Snapshot
 }
@@ -183,17 +183,18 @@ type Candidate struct {
 
 // RehearsalOutcome reports how one pinned rehearsal request ended.
 type RehearsalOutcome struct {
-	RequestID string
-	Source    string
-	Method    string
-	Path      string
-	Status    int
-	Error     string
-	Canceled  bool
-	Aborted   bool
+	RequestID  string
+	Source     string
+	Method     string
+	Path       string
+	Status     int
+	Error      string
+	Canceled   bool
+	Aborted    bool
 	BusinessID string
 	Side       Side
 	Attempt    int
+	Round      string
 }
 
 type Store struct {
@@ -242,8 +243,11 @@ func (s *Store) Select(request *http.Request) Selection {
 	defer s.mu.Unlock()
 	if id := request.Header.Get(RehearsalHeader); id != "" {
 		if candidate, ok := s.candidates[id]; ok && candidate.State == StateStaged && candidate.PlanConfirmed {
-			candidate.Rehearsal.InFlight++
-			return Selection{Snapshot: candidate.snapshot, ID: candidate.ID, CandidateID: candidate.ID}
+			if Side(request.Header.Get(ExecutionSideHeader)) != SideBaseline {
+				candidate.Rehearsal.InFlight++
+				return Selection{Snapshot: candidate.snapshot, ID: candidate.ID, CandidateID: candidate.ID}
+			}
+			return Selection{Snapshot: s.active, ID: s.activeID, CandidateID: candidate.ID}
 		}
 	}
 	return Selection{Snapshot: s.active, ID: s.activeID}
@@ -382,20 +386,23 @@ func (s *Store) Stage(snapshot *config.Snapshot) Candidate {
 		coverage[category.ID] = &CategoryStats{Required: int64(category.MinSamples)}
 	}
 	candidate := &Candidate{
-		ID:            fmt.Sprintf("cand-%d", s.candSeq),
-		CreatedAt:     time.Now(),
-		State:         StateStaged,
-		Routes:        snapshot.DescribeRoutes(),
-		Fingerprint:   fingerprint,
-		CoveragePlan:  plan,
-		PlanConfirmed: len(plan) == 0,
-		Coverage:      coverage,
-		Evidence:      []EvidenceEntry{},
+		ID:             fmt.Sprintf("cand-%d", s.candSeq),
+		CreatedAt:      time.Now(),
+		State:          StateStaged,
+		Routes:         snapshot.DescribeRoutes(),
+		Fingerprint:    fingerprint,
+		CoveragePlan:   plan,
+		PlanConfirmed:  len(plan) == 0,
+		Coverage:       coverage,
+		Evidence:       []EvidenceEntry{},
+		EvidencePolicy: snapshot.EvidencePolicy(),
+		ReviewVersion:  1,
 		Rehearsal: RehearsalSummary{
 			RequiredSuccesses: int64(snapshot.MinSuccessfulRehearsals()),
 		},
 		snapshot: snapshot,
 		seen:     make(map[string]struct{}),
+		pairs:    make(map[string]*BusinessPair),
 	}
 	s.candidates[candidate.ID] = candidate
 	for _, existing := range s.candidates {
@@ -445,6 +452,9 @@ func (s *Store) Confirm(candidateID string) (Release, error) {
 	candidate.ResolvedAt = time.Now()
 	release := s.appendReleaseLocked(KindPromote, candidate.ID, candidate.snapshot, &summary)
 	release.Coverage = candidate.categoryReportsLocked(s.active, s.activeID)
+	release.ReviewVersion = candidate.ReviewVersion
+	release.EvidencePolicy = candidate.EvidencePolicy
+	release.AdoptedPairs = candidate.adoptedPairRefsLocked()
 	s.history[len(s.history)-1] = release
 	s.active = candidate.snapshot
 	s.activeID = release.ID
@@ -641,13 +651,15 @@ func (s *Store) appendReleaseLocked(kind Kind, sourceID string, snapshot *config
 // evidence; changing category rules or coverage requirements does.
 func Fingerprint(snapshot *config.Snapshot) string {
 	payload := struct {
-		Upstreams []config.Upstream         `json:"upstreams"`
-		Routes    []config.Route            `json:"routes"`
-		Coverage  []config.CoverageCategory `json:"coverage"`
+		Upstreams      []config.Upstream         `json:"upstreams"`
+		Routes         []config.Route            `json:"routes"`
+		Coverage       []config.CoverageCategory `json:"coverage"`
+		EvidencePolicy string                    `json:"evidence_policy"`
 	}{
-		Upstreams: snapshot.Upstreams(),
-		Routes:    snapshot.Routes(),
-		Coverage:  snapshot.CoverageCategories(),
+		Upstreams:      snapshot.Upstreams(),
+		Routes:         snapshot.Routes(),
+		Coverage:       snapshot.CoverageCategories(),
+		EvidencePolicy: snapshot.EvidencePolicy(),
 	}
 	data, _ := json.Marshal(payload)
 	sum := sha256.Sum256(data)
