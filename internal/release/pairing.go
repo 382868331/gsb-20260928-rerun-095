@@ -77,6 +77,8 @@ type AdoptedPairRef struct {
 	Conclusion         string   `json:"conclusion"`
 	BaselineRequestID  string   `json:"baseline_request_id,omitempty"`
 	CandidateRequestID string   `json:"candidate_request_id,omitempty"`
+	BaselineAttempt    int      `json:"baseline_attempt,omitempty"`
+	CandidateAttempt   int      `json:"candidate_attempt,omitempty"`
 	Method             string   `json:"method,omitempty"`
 	Path               string   `json:"path,omitempty"`
 	Categories         []string `json:"categories,omitempty"`
@@ -89,6 +91,9 @@ func (s *Store) StartCollectionRound(candidateID string) (CollectionRound, error
 	candidate, ok := s.candidates[candidateID]
 	if !ok {
 		return CollectionRound{}, fmt.Errorf("%w %q", ErrUnknownCandidate, candidateID)
+	}
+	if candidate.State != StateStaged {
+		return CollectionRound{}, fmt.Errorf("%w: %s", ErrNotStaged, candidate.State)
 	}
 	if candidate.currentRound != nil && candidate.currentRound.Open {
 		return CollectionRound{}, fmt.Errorf("collection round %s is already open", candidate.currentRound.ID)
@@ -157,7 +162,7 @@ func (s *Store) RecordExecution(candidateID string, outcome RehearsalOutcome) er
 		roundID = candidate.currentRound.ID
 	}
 	now := time.Now()
-	late := candidate.isLateLocked(roundID)
+	late, lateReason := candidate.latenessLocked(roundID)
 	pair := candidate.pairs[outcome.BusinessID]
 	if pair == nil {
 		pair = &BusinessPair{BusinessID: outcome.BusinessID, RoundID: roundID}
@@ -168,7 +173,7 @@ func (s *Store) RecordExecution(candidateID string, outcome RehearsalOutcome) er
 	}
 	if roundID == "" {
 		roundID = pair.RoundID
-		late = candidate.isLateLocked(roundID)
+		late, lateReason = candidate.latenessLocked(roundID)
 	}
 	existing := pair.side(outcome.Side)
 	adopted := !late && existing == nil
@@ -189,13 +194,12 @@ func (s *Store) RecordExecution(candidateID string, outcome RehearsalOutcome) er
 	conclusion := "retry_ignored"
 	if late {
 		conclusion = "late_ignored"
-		reason := fmt.Sprintf("collection round %s is closed", roundID)
 		candidate.lateDecisions = append(candidate.lateDecisions, LateDecision{
 			BusinessID: outcome.BusinessID,
 			Side:       outcome.Side,
 			RequestID:  outcome.RequestID,
 			RoundID:    roundID,
-			Reason:     reason,
+			Reason:     lateReason,
 			At:         now,
 		})
 	} else if existing == nil {
@@ -258,16 +262,28 @@ func (p *BusinessPair) setSide(side Side, execution *Execution) {
 	}
 }
 
-func (c *Candidate) isLateLocked(roundID string) bool {
+// latenessLocked reports whether an execution arriving now can no longer be
+// adopted, and why. Once the candidate is resolved (confirmed, discarded or
+// superseded) its adopted evidence is frozen: every further execution is a
+// queryable supplemental fact that can never change the published
+// success/failure/category conclusions. The same holds for executions that
+// declare an already closed collection round.
+func (c *Candidate) latenessLocked(roundID string) (bool, string) {
+	if c.State != StateStaged {
+		return true, fmt.Sprintf("candidate %s is %s: adopted evidence is frozen and cannot alter the published conclusions", c.ID, c.State)
+	}
 	if roundID == "" {
-		return false
+		return false, ""
 	}
 	for _, round := range c.rounds {
 		if round.ID == roundID {
-			return !round.Open
+			if !round.Open {
+				return true, fmt.Sprintf("collection round %s is closed", roundID)
+			}
+			return false, ""
 		}
 	}
-	return false
+	return false, ""
 }
 
 func (c *Candidate) closeCurrentRoundLocked() {
@@ -337,7 +353,7 @@ func unionStrings(existing, additional []string) []string {
 func (c *Candidate) adoptedPairRefsLocked() []AdoptedPairRef {
 	refs := []AdoptedPairRef{}
 	for _, pair := range c.pairs {
-		if !pair.Decided || pair.Conclusion != "valid" {
+		if !pair.Decided {
 			continue
 		}
 		refs = append(refs, pair.refLocked())
@@ -367,11 +383,13 @@ func (p *BusinessPair) refLocked() AdoptedPairRef {
 	}
 	if p.Baseline != nil {
 		ref.BaselineRequestID = p.Baseline.RequestID
+		ref.BaselineAttempt = p.Baseline.Attempt
 		ref.Method = p.Baseline.Method
 		ref.Path = p.Baseline.Path
 	}
 	if p.Candidate != nil {
 		ref.CandidateRequestID = p.Candidate.RequestID
+		ref.CandidateAttempt = p.Candidate.Attempt
 		if ref.Method == "" {
 			ref.Method = p.Candidate.Method
 			ref.Path = p.Candidate.Path

@@ -107,6 +107,8 @@ curl -X POST http://127.0.0.1:8080/__gateway/candidates/cand-1/rounds/close
 - 每个业务 ID 形成一个基线/候选请求对；一侧的首个终态结果被采用，后续重试只保留为证据，不能覆盖失败等不利结果。
 - 一个请求同时命中多个类别时，整体只计一次配对成功，各类别分别获得一个去重样本；报告中的 `pair_refs` 和发布记录中的 `adopted_pairs` 都保存业务 ID、轮次及两侧 request ID。
 - 轮次关闭后，未集齐两侧的请求标记为 `undecided`；之后才到达且声明该轮次的执行标记为 `late_ignored`，写入 `late_decisions`，不会改变关闭时的结论。
+- 确认（或放弃）会固定当时采用的请求对：确认前先关闭仍打开的轮次，未集齐的对记为 `undecided`。此后到达的结果一律标记为 `late_ignored`，只作为可查询的补充事实写入 `late_decisions`（记录所属轮次、未采用原因和到达时间），不能再被采用或计数，也不能改变已发布的成功、失败及类别覆盖结论；已解决的候选不允许重开收集轮次，重复提交同一请求也不会被重新纳入旧发布。
+- 发布记录中的 `adopted_pairs` 稳定保存当时实际采用的请求编号与尝试次数（`baseline_request_id`/`baseline_attempt`、`candidate_request_id`/`candidate_attempt`），有效、不利与未决结论都可追溯到具体请求对。
 
 ## 优雅关停
 

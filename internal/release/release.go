@@ -277,6 +277,23 @@ func (c *Candidate) legacyFinishLocked(outcome RehearsalOutcome, kind string) {
 			c.seen[outcome.RequestID] = struct{}{}
 		}
 	}
+	late := false
+	conclusion := ""
+	if c.State != StateStaged {
+		// The candidate is resolved: its release basis is frozen, so a
+		// late outcome stays a queryable fact but is never counted.
+		counted = false
+		late = true
+		conclusion = "late_ignored"
+		c.lateDecisions = append(c.lateDecisions, LateDecision{
+			BusinessID: outcome.BusinessID,
+			Side:       outcome.Side,
+			RequestID:  outcome.RequestID,
+			RoundID:    outcome.Round,
+			Reason:     fmt.Sprintf("candidate %s is %s: adopted evidence is frozen and cannot alter the published conclusions", c.ID, c.State),
+			At:         time.Now(),
+		})
+	}
 	source := outcome.Source
 	if source == "" {
 		source = "rehearsal"
@@ -325,6 +342,8 @@ func (c *Candidate) legacyFinishLocked(outcome RehearsalOutcome, kind string) {
 		Categories: categories,
 		Outcome:    kind,
 		Counted:    counted,
+		Late:       late,
+		Conclusion: conclusion,
 		At:         time.Now(),
 	})
 }
@@ -446,6 +465,12 @@ func (s *Store) Confirm(candidateID string) (Release, error) {
 	}
 	if readiness := candidate.readinessLocked(); !readiness.Ready {
 		return Release{}, fmt.Errorf("candidate %q cannot be confirmed: %s", candidateID, readiness.Reason)
+	}
+	if candidate.currentRound != nil && candidate.currentRound.Open {
+		// Confirming fixes the adopted request pairs: the still-open
+		// collection round is closed first so incomplete pairs become
+		// undecided and nothing arriving later can change the basis.
+		candidate.closeCurrentRoundLocked()
 	}
 	summary := candidate.Rehearsal
 	candidate.State = StateConfirmed
