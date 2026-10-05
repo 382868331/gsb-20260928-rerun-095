@@ -78,13 +78,28 @@ func (s *Store) Report(candidateID string) (CandidateReport, error) {
 		State:         candidate.State,
 		EvidenceValid: candidate.State == StateStaged || candidate.State == StateConfirmed,
 		PlanConfirmed: candidate.PlanConfirmed,
-		Overall:       candidate.Rehearsal,
-		Categories:    candidate.categoryReportsLocked(s.active, s.activeID),
 		Supplements:   supplementReports(candidate.Evidence),
 		Rounds:        collectionRoundViews(candidate.rounds),
 		LateDecisions: append([]LateDecision(nil), candidate.lateDecisions...),
-		PairRefs:      candidate.pairRefsLocked(),
 		Evidence:      append([]EvidenceEntry(nil), candidate.Evidence...),
+	}
+	if candidate.State == StateConfirmed {
+		// A confirmed candidate feeds an immutable release: its success,
+		// failure and category coverage conclusions are fixed at promotion
+		// time. Late arrivals stay queryable as evidence/late decisions but
+		// must not change the published snapshot.
+		for _, release := range s.history {
+			if release.SourceID == candidate.ID && release.Kind == KindPromote {
+				report.Overall = *release.Rehearsal
+				report.Categories = append([]CategoryReport(nil), release.Coverage...)
+				report.PairRefs = append([]AdoptedPairRef(nil), release.AdoptedPairs...)
+				break
+			}
+		}
+	} else {
+		report.Overall = candidate.Rehearsal
+		report.Categories = candidate.categoryReportsLocked(s.active, s.activeID)
+		report.PairRefs = candidate.pairRefsLocked()
 	}
 	switch candidate.State {
 	case StateSuperseded:

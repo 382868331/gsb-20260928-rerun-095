@@ -378,6 +378,7 @@ func (s *Store) Stage(snapshot *config.Snapshot) Candidate {
 		}
 		existing.State = StateSuperseded
 		existing.ResolvedAt = time.Now()
+		existing.closeOpenRoundLocked("candidate superseded by a revised configuration")
 	}
 	s.candSeq++
 	plan := snapshot.CoverageCategories()
@@ -450,6 +451,7 @@ func (s *Store) Confirm(candidateID string) (Release, error) {
 	summary := candidate.Rehearsal
 	candidate.State = StateConfirmed
 	candidate.ResolvedAt = time.Now()
+	candidate.closeOpenRoundLocked("candidate confirmed and promoted")
 	release := s.appendReleaseLocked(KindPromote, candidate.ID, candidate.snapshot, &summary)
 	release.Coverage = candidate.categoryReportsLocked(s.active, s.activeID)
 	release.ReviewVersion = candidate.ReviewVersion
@@ -477,6 +479,7 @@ func (s *Store) Discard(candidateID string) (Candidate, error) {
 	}
 	candidate.State = StateDiscarded
 	candidate.ResolvedAt = time.Now()
+	candidate.closeOpenRoundLocked("candidate discarded")
 	return *candidate, nil
 }
 

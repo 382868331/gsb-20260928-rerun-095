@@ -64,6 +64,7 @@ type LateDecision struct {
 	BusinessID string    `json:"business_id"`
 	Side       Side      `json:"side"`
 	RequestID  string    `json:"request_id"`
+	Attempt    int       `json:"attempt,omitempty"`
 	RoundID    string    `json:"round_id"`
 	Reason     string    `json:"reason"`
 	At         time.Time `json:"at"`
@@ -77,6 +78,8 @@ type AdoptedPairRef struct {
 	Conclusion         string   `json:"conclusion"`
 	BaselineRequestID  string   `json:"baseline_request_id,omitempty"`
 	CandidateRequestID string   `json:"candidate_request_id,omitempty"`
+	BaselineAttempt    int      `json:"baseline_attempt,omitempty"`
+	CandidateAttempt   int      `json:"candidate_attempt,omitempty"`
 	Method             string   `json:"method,omitempty"`
 	Path               string   `json:"path,omitempty"`
 	Categories         []string `json:"categories,omitempty"`
@@ -120,6 +123,13 @@ func (s *Store) CloseCollectionRound(candidateID string) (CollectionRound, error
 	return *candidate.currentRound, nil
 }
 
+// pairKey scopes a business request pair to one collection round. The same
+// business id reused in a later round forms an independent pair, so evidence
+// from a reopened collection can never flow back into an earlier decision.
+func pairKey(businessID, roundID string) string {
+	return roundID + "\x00" + businessID
+}
+
 // RecordExecution records one terminal baseline or candidate execution. It
 // implements first-terminal adoption, request pairing and late-round policy.
 func (s *Store) RecordExecution(candidateID string, outcome RehearsalOutcome) error {
@@ -157,18 +167,16 @@ func (s *Store) RecordExecution(candidateID string, outcome RehearsalOutcome) er
 		roundID = candidate.currentRound.ID
 	}
 	now := time.Now()
-	late := candidate.isLateLocked(roundID)
-	pair := candidate.pairs[outcome.BusinessID]
+	if roundID == "" {
+		if round := candidate.lastRoundLocked(); round != nil {
+			roundID = round.ID
+		}
+	}
+	late, lateReason := candidate.executionLatenessLocked(roundID)
+	pair := candidate.pairs[pairKey(outcome.BusinessID, roundID)]
 	if pair == nil {
 		pair = &BusinessPair{BusinessID: outcome.BusinessID, RoundID: roundID}
-		candidate.pairs[outcome.BusinessID] = pair
-	}
-	if pair.RoundID == "" {
-		pair.RoundID = roundID
-	}
-	if roundID == "" {
-		roundID = pair.RoundID
-		late = candidate.isLateLocked(roundID)
+		candidate.pairs[pairKey(outcome.BusinessID, roundID)] = pair
 	}
 	existing := pair.side(outcome.Side)
 	adopted := !late && existing == nil
@@ -189,16 +197,16 @@ func (s *Store) RecordExecution(candidateID string, outcome RehearsalOutcome) er
 	conclusion := "retry_ignored"
 	if late {
 		conclusion = "late_ignored"
-		reason := fmt.Sprintf("collection round %s is closed", roundID)
 		candidate.lateDecisions = append(candidate.lateDecisions, LateDecision{
 			BusinessID: outcome.BusinessID,
 			Side:       outcome.Side,
 			RequestID:  outcome.RequestID,
+			Attempt:    outcome.Attempt,
 			RoundID:    roundID,
-			Reason:     reason,
+			Reason:     lateReason,
 			At:         now,
 		})
-	} else if existing == nil {
+	} else if existing == nil && !pair.Decided {
 		pair.setSide(outcome.Side, execution)
 		pair.Categories = unionStrings(pair.Categories, categories)
 		conclusion = "adopted"
@@ -258,16 +266,46 @@ func (p *BusinessPair) setSide(side Side, execution *Execution) {
 	}
 }
 
-func (c *Candidate) isLateLocked(roundID string) bool {
-	if roundID == "" {
-		return false
+// executionLatenessLocked reports whether an execution can no longer be
+// adopted and why. Adoption freezes the moment the candidate is resolved
+// (confirmed, discarded or superseded) or its collection round closes;
+// declaring an unknown round is also treated as late so a caller can never
+// reopen an earlier release with a fabricated round id.
+func (c *Candidate) executionLatenessLocked(roundID string) (bool, string) {
+	switch c.State {
+	case StateConfirmed:
+		return true, fmt.Sprintf("candidate %s is confirmed and its release evidence is frozen", c.ID)
+	case StateDiscarded:
+		return true, fmt.Sprintf("candidate %s is discarded and its evidence is retained for reference only", c.ID)
+	case StateSuperseded:
+		reason := fmt.Sprintf("candidate %s is superseded", c.ID)
+		if c.InvalidatedBy != "" {
+			reason = fmt.Sprintf("candidate %s is superseded by %s", c.ID, c.InvalidatedBy)
+		}
+		return true, reason + ": its evidence is no longer a valid release basis"
 	}
 	for _, round := range c.rounds {
 		if round.ID == roundID {
-			return !round.Open
+			if round.Open {
+				return false, ""
+			}
+			return true, fmt.Sprintf("collection round %s is closed", roundID)
 		}
 	}
-	return false
+	if roundID != "" {
+		return true, fmt.Sprintf("collection round %s is not open for this candidate", roundID)
+	}
+	return true, "candidate has no open collection round"
+}
+
+// lastRoundLocked returns the most recently started round, if any, so an
+// execution that omits the round header can still be attributed for querying
+// even after collection has ended.
+func (c *Candidate) lastRoundLocked() *CollectionRound {
+	if len(c.rounds) == 0 {
+		return nil
+	}
+	return c.rounds[len(c.rounds)-1]
 }
 
 func (c *Candidate) closeCurrentRoundLocked() {
@@ -291,6 +329,15 @@ func (c *Candidate) closeCurrentRoundLocked() {
 				}
 			}
 		}
+	}
+}
+
+// closeOpenRoundLocked freezes the currently open round when a candidate is
+// resolved. Any single-sided pair still in flight at that moment becomes
+// undecided, exactly like an explicit round close.
+func (c *Candidate) closeOpenRoundLocked(_ string) {
+	if c.currentRound != nil && c.currentRound.Open {
+		c.closeCurrentRoundLocked()
 	}
 }
 
@@ -367,11 +414,13 @@ func (p *BusinessPair) refLocked() AdoptedPairRef {
 	}
 	if p.Baseline != nil {
 		ref.BaselineRequestID = p.Baseline.RequestID
+		ref.BaselineAttempt = p.Baseline.Attempt
 		ref.Method = p.Baseline.Method
 		ref.Path = p.Baseline.Path
 	}
 	if p.Candidate != nil {
 		ref.CandidateRequestID = p.Candidate.RequestID
+		ref.CandidateAttempt = p.Candidate.Attempt
 		if ref.Method == "" {
 			ref.Method = p.Candidate.Method
 			ref.Path = p.Candidate.Path
